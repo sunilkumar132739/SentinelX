@@ -1,338 +1,247 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware # NEW: Import the CORS tool
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 import nmap
-import socket
-from sqlalchemy.orm import Session
-from database import SessionLocal, engine, Base, Target, ScanRun, DiscoveredService
+import datetime
+import requests
+import os
+from fpdf import FPDF
+from fastapi.responses import FileResponse
 
-# Create the database tables automatically when the app starts
+# Database Setup
+SQLALCHEMY_DATABASE_URL = "sqlite:///./sentinelx.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Database Models
+class ScanHistory(Base):
+    __tablename__ = "scan_history"
+    id = Column(Integer, primary_key=True, index=True)
+    target_ip = Column(String, index=True)
+    hostname = Column(String)
+    scan_time = Column(DateTime, default=datetime.datetime.utcnow)
+    services = relationship("ServiceDetail", back_populates="scan")
+
+class ServiceDetail(Base):
+    __tablename__ = "service_details"
+    id = Column(Integer, primary_key=True, index=True)
+    scan_id = Column(Integer, ForeignKey("scan_history.id"))
+    port = Column(Integer)
+    protocol = Column(String)
+    state = Column(String)
+    service_name = Column(String)
+    version_info = Column(String)
+    cves = Column(String) # Store CVEs as comma-separated string
+    scan = relationship("ScanHistory", back_populates="services")
+
 Base.metadata.create_all(bind=engine)
 
-# 1. Initialize the FastAPI application
-app = FastAPI(
-    title="SentinelX API",
-    description="Backend engine for the SentinelX Attack Surface platform",
-    version="0.3"
-)
+# Initialize FastAPI
+app = FastAPI(title="SentinelX API", version="0.4")
 
-# --- NEW: Configure CORS to allow the frontend to talk to the backend ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins (good for local testing)
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-# ------------------------------------------------------------------------
 
-# 2. Define our Pydantic Data Models
-# FastAPI uses these to automatically validate data coming in and going out,
-# and generates free documentation for us!
-from pydantic import BaseModel
-from typing import List, Optional
-
-# --- NEW: Import requests and time for NVD API ---
-import requests
-import time
-# -------------------------------------------------
-
-# --- NEW: Import PDF library ---
-from fpdf import FPDF
-from fastapi.responses import StreamingResponse
-import io
-# -------------------------------
-
-# --- NEW: Database Helper Function ---
-# This opens a connection to the database and ensures it closes when done
+# Dependency to get DB session
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-# -------------------------------------
 
-class ServiceInfo(BaseModel):
-    port: int
-    state: str
-    service: str
-    version_info: str
-    cves: str = "" # NEW: Add CVEs to our Data Model
-
-class ScanResult(BaseModel):
-    target_ip: str
-    hostname: str
-    status: str
-    services: List[ServiceInfo]
-
-# --- NEW MODELS FOR HISTORY ---
-from datetime import datetime
-
-class ScanHistoryItem(BaseModel):
-    id: int
-    target_ip: str
-    hostname: str
-    status: str
-    timestamp: datetime
-
-# --- NEW: NVD API Helper Function ---
-def fetch_cves_from_nvd(version_info: str) -> str:
-    """Queries the NIST National Vulnerability Database for known CVEs."""
-    if not version_info or version_info == "No version detected":
-        return ""
+# Helper: Fetch CVEs from NVD
+def get_cves_for_service(service_name, version):
+    if not version or len(version) < 2:
+        return []
     
-    # Nmap gives us detailed banners like "OpenSSH 6.6.1p1 Ubuntu". 
-    # If we search that entire string, NIST will get confused. 
-    # We will just take the first two words (e.g., "OpenSSH 6.6") for a broader search.
-    search_terms = " ".join(version_info.split()[:2])
-    
-    # We ask the API for a maximum of 3 results to keep things fast and clean
-    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={search_terms}&resultsPerPage=3"
+    search_query = f"{service_name} {version}"
+    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={search_query}&resultsPerPage=3"
     
     try:
-        # NIST strictly rate-limits free, unauthenticated API calls (5 per 30 seconds).
-        # We add a 1.5 second pause so they don't block our IP address.
-        time.sleep(1.5) 
-        
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             data = response.json()
-            cve_items = data.get("vulnerabilities", [])
-            
-            # Extract just the CVE IDs (like "CVE-2014-0001")
             cve_list = []
-            for item in cve_items:
-                cve_id = item.get("cve", {}).get("id")
+            for vuln in data.get("vulnerabilities", []):
+                cve_id = vuln.get("cve", {}).get("id")
                 if cve_id:
                     cve_list.append(cve_id)
-                    
-            return ", ".join(cve_list)
-        elif response.status_code == 403:
-            return "NVD API Rate Limited"
+            return cve_list
     except Exception as e:
         print(f"NVD API Error: {e}")
-        
-    return ""
-# ------------------------------------
-
-def run_nmap_scan(target: str) -> ScanResult:
-    nm = nmap.PortScanner()
     
-    try:
-        # We are keeping the scan scope small (-p 22,80,443,3389) for speed during testing
-        nm.scan(target, arguments='-p 22,80,443,3389 -sV')
-    except nmap.PortScannerError as e:
-        raise HTTPException(status_code=500, detail=f"Nmap Error: {e}")
-    except Exception as e:
-         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+    return []
 
-    # If Nmap didn't find the host, return a 404
-    if not nm.all_hosts():
-        raise HTTPException(status_code=404, detail="Host not found or is down.")
-
-    # 4. Parse the results into our new Data Models
-    # We only take the first host since we are scanning one IP at a time
-    host = nm.all_hosts()[0]
-    hostname = nm[host].hostname()
-    status = nm[host].state()
-    
-    discovered_services = []
-    
-    for proto in nm[host].all_protocols():
-        ports = sorted(nm[host][proto].keys())
-        
-        for port in ports:
-            port_data = nm[host][proto][port]
-            
-            # Extract info just like V0.2
-            product = port_data.get('product', '')
-            version = port_data.get('version', '')
-            service_info = f"{product} {version}".strip()
-            if not service_info:
-                service_info = "No version detected"
-            
-            # --- NEW: Fetch CVEs dynamically ---
-            cves_found = fetch_cves_from_nvd(service_info)
-            # -----------------------------------
-                
-            # Create a ServiceInfo object and add it to our list
-            svc = ServiceInfo(
-                port=port,
-                state=port_data.get('state', 'unknown'),
-                service=port_data.get('name', 'unknown'),
-                version_info=service_info,
-                cves=cves_found # NEW: Attach the CVEs
-            )
-            discovered_services.append(svc)
-            
-    # Combine everything into the final ScanResult object
-    return ScanResult(
-        target_ip=host,
-        hostname=hostname,
-        status=status,
-        services=discovered_services
-    )
-
-# 5. Define the API Routes (Endpoints)
 @app.get("/")
-def read_root():
-    """Health check endpoint to see if the API is running."""
-    return {"status": "SentinelX API is online", "version": "0.3"}
+def root():
+    return {"status": "SentinelX API is online", "version": "0.4"}
 
-@app.get("/scan/{target}", response_model=ScanResult)
+@app.get("/scan/{target}")
 def scan_target(target: str, db: Session = Depends(get_db)):
-    """
-    Endpoint to trigger a scan.
-    Example: http://localhost:8000/scan/scanme.nmap.org
-    """
-    # Quick safety check: ensure the target resolves to an IP before scanning
+    nm = nmap.PortScanner()
     try:
-         socket.gethostbyname(target)
-    except socket.gaierror:
-         raise HTTPException(status_code=400, detail="Invalid hostname or IP address.")
-         
-    # Run the engine and get the JSON
-    scan_data = run_nmap_scan(target)
+        # Run Nmap scan
+        nm.scan(target, arguments='-sV -F')
+    except nmap.PortScannerError:
+        raise HTTPException(status_code=500, detail="Nmap execution failed")
     
-    # --- NEW: Save to Database ---
-    # 1. Find or create the target
-    db_target = db.query(Target).filter(Target.ip == scan_data.target_ip).first()
-    if not db_target:
-        db_target = Target(ip=scan_data.target_ip, hostname=scan_data.hostname)
-        db.add(db_target)
-        db.commit()
-        db.refresh(db_target)
-        
-    # 2. Create a new scan record
-    db_scan = ScanRun(target_id=db_target.id, status=scan_data.status)
+    if target not in nm.all_hosts():
+        hosts = nm.all_hosts()
+        if not hosts:
+            raise HTTPException(status_code=404, detail="Target not found or down")
+        host = hosts[0]
+    else:
+        host = target
+
+    hostname = nm[host].hostname() if nm[host].hostname() else host
+    
+    # 1. NEW PHASE 3: Fetch Previous Scan for Diff Engine
+    previous_scan = db.query(ScanHistory).filter(ScanHistory.target_ip == host).order_by(ScanHistory.scan_time.desc()).first()
+    previous_ports = []
+    if previous_scan:
+        previous_ports = [svc.port for svc in previous_scan.services if svc.state == 'open']
+
+    # 2. Save New Scan to Database
+    db_scan = ScanHistory(target_ip=host, hostname=hostname)
     db.add(db_scan)
     db.commit()
     db.refresh(db_scan)
     
-    # 3. Save all discovered services attached to this scan
-    for svc in scan_data.services:
-        db_svc = DiscoveredService(
-            scan_id=db_scan.id,
-            port=svc.port,
-            state=svc.state,
-            service=svc.service,
-            version_info=svc.version_info,
-            cves=svc.cves # NEW: Save CVEs to database
-        )
-        db.add(db_svc)
+    services_data = []
+    current_open_ports = []
+
+    for proto in nm[host].all_protocols():
+        ports = nm[host][proto].keys()
+        for port in ports:
+            state = nm[host][proto][port]['state']
+            name = nm[host][proto][port]['name']
+            product = nm[host][proto][port].get('product', '')
+            version = nm[host][proto][port].get('version', '')
+            extrainfo = nm[host][proto][port].get('extrainfo', '')
+            
+            full_version = f"{product} {version} {extrainfo}".strip()
+            
+            if state == 'open':
+                current_open_ports.append(port)
+            
+            # Fetch CVEs if port is open
+            cve_list = []
+            if state == 'open' and full_version:
+                cve_list = get_cves_for_service(name, version)
+            
+            cves_str = ",".join(cve_list)
+
+            svc = ServiceDetail(
+                scan_id=db_scan.id,
+                port=port,
+                protocol=proto,
+                state=state,
+                service_name=name,
+                version_info=full_version,
+                cves=cves_str
+            )
+            db.add(svc)
+            
+            services_data.append({
+                "port": port,
+                "protocol": proto,
+                "state": state,
+                "service": name,
+                "version_info": full_version,
+                "cves": cve_list
+            })
     
     db.commit()
-    # -----------------------------
 
-    return scan_data
-
-# --- NEW: History Endpoints ---
-@app.get("/scans", response_model=List[ScanHistoryItem])
-def get_scan_history(db: Session = Depends(get_db)):
-    """Fetch all previous scans."""
-    scans = db.query(ScanRun, Target).join(Target).order_by(ScanRun.timestamp.desc()).all()
+    # 3. NEW PHASE 3: Calculate Differences
+    changes = {
+        "is_first_scan": previous_scan is None,
+        "new_ports": [],
+        "closed_ports": []
+    }
     
-    history = []
-    for scan, target in scans:
-        history.append(ScanHistoryItem(
-            id=scan.id,
-            target_ip=target.ip,
-            hostname=target.hostname,
-            status=scan.status,
-            timestamp=scan.timestamp
-        ))
-    return history
+    if previous_scan:
+        changes["new_ports"] = list(set(current_open_ports) - set(previous_ports))
+        changes["closed_ports"] = list(set(previous_ports) - set(current_open_ports))
 
-@app.get("/scans/{scan_id}", response_model=ScanResult)
-def get_scan_details(scan_id: int, db: Session = Depends(get_db)):
-    """Fetch the exact results of a specific older scan."""
-    scan = db.query(ScanRun).filter(ScanRun.id == scan_id).first()
+    return {
+        "scan_id": db_scan.id,
+        "target_ip": host,
+        "hostname": hostname,
+        "scan_time": db_scan.scan_time.isoformat(),
+        "services": services_data,
+        "changes": changes
+    }
+
+@app.get("/history")
+def get_history(db: Session = Depends(get_db)):
+    scans = db.query(ScanHistory).order_by(ScanHistory.scan_time.desc()).all()
+    return [{"id": s.id, "target": s.target_ip, "time": s.scan_time.isoformat()} for s in scans]
+
+@app.get("/history/{scan_id}")
+def get_scan_result(scan_id: int, db: Session = Depends(get_db)):
+    scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
-        
-    # Reconstruct the services list
-    services = []
+    
+    services_data = []
     for svc in scan.services:
-        services.append(ServiceInfo(
-            port=svc.port,
-            state=svc.state,
-            service=svc.service,
-            version_info=svc.version_info,
-            cves=svc.cves or "" # NEW: Retrieve CVEs from database
-        ))
-        
-    return ScanResult(
-        target_ip=scan.target.ip,
-        hostname=scan.target.hostname,
-        status=scan.status,
-        services=services
-    )
+        cve_list = svc.cves.split(",") if svc.cves else []
+        services_data.append({
+            "port": svc.port,
+            "protocol": svc.protocol,
+            "state": svc.state,
+            "service": svc.service_name,
+            "version_info": svc.version_info,
+            "cves": cve_list
+        })
+    
+    return {
+        "scan_id": scan.id,
+        "target_ip": scan.target_ip,
+        "hostname": scan.hostname,
+        "scan_time": scan.scan_time.isoformat(),
+        "services": services_data
+    }
 
-# --- NEW: PDF Report Endpoint ---
 @app.get("/scans/{scan_id}/pdf")
-def download_scan_pdf(scan_id: int, db: Session = Depends(get_db)):
-    """Generate and download a PDF report for a scan."""
-    # 1. Fetch data from DB
-    scan = db.query(ScanRun).filter(ScanRun.id == scan_id).first()
+def download_pdf(scan_id: int, db: Session = Depends(get_db)):
+    scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
-        
-    # 2. Initialize PDF
+    
     pdf = FPDF()
     pdf.add_page()
     
-    # Header
-    pdf.set_font("helvetica", "B", 24)
-    pdf.set_text_color(41, 128, 185) # Blue color
-    pdf.cell(0, 10, "SentinelX Security Report", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(200, 10, txt="SentinelX Security Report", ln=True, align='C')
+    
+    pdf.set_font("Arial", '', 12)
+    pdf.cell(200, 10, txt=f"Target: {scan.target_ip} ({scan.hostname})", ln=True)
+    pdf.cell(200, 10, txt=f"Scan Date: {scan.scan_time.strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
+    
     pdf.ln(10)
     
-    # Target Info
-    pdf.set_font("helvetica", "B", 14)
-    pdf.set_text_color(0, 0, 0)
-    pdf.cell(0, 10, f"Target: {scan.target.ip} ({scan.target.hostname or 'Unknown'})", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("helvetica", "", 12)
-    pdf.cell(0, 10, f"Scan Date: {scan.timestamp.strftime('%Y-%m-%d %H:%M:%S')}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 10, f"Status: {scan.status}", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(10)
-    
-    # Services Table Header
-    pdf.set_font("helvetica", "B", 12)
-    pdf.set_fill_color(200, 220, 255)
-    pdf.cell(30, 10, "Port", border=1, fill=True)
-    pdf.cell(30, 10, "State", border=1, fill=True)
-    pdf.cell(40, 10, "Service", border=1, fill=True)
-    pdf.cell(90, 10, "Version Info", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
-    
-    # Services Table Data
-    pdf.set_font("helvetica", "", 10)
     for svc in scan.services:
-        # Check if port is open to color it red
-        if svc.state.lower() == 'open':
-            pdf.set_text_color(200, 0, 0)
-        else:
-            pdf.set_text_color(0, 0, 0)
-            
-        pdf.cell(30, 10, str(svc.port), border=1)
-        pdf.cell(30, 10, svc.state, border=1)
-        pdf.set_text_color(0, 0, 0) # Reset color for remaining columns
-        pdf.cell(40, 10, svc.service, border=1)
+        pdf.set_font("Arial", 'B', 12)
+        pdf.cell(200, 10, txt=f"Port {svc.port} ({svc.protocol}) - {svc.state.upper()}", ln=True)
+        pdf.set_font("Arial", '', 12)
+        pdf.cell(200, 10, txt=f"Service: {svc.service_name}", ln=True)
+        if svc.version_info:
+            pdf.cell(200, 10, txt=f"Version: {svc.version_info}", ln=True)
+        if svc.cves:
+            pdf.cell(200, 10, txt=f"CVEs: {svc.cves}", ln=True)
+        pdf.ln(5)
         
-        # Handle long version info text
-        version_text = svc.version_info
-        if len(version_text) > 40:
-             version_text = version_text[:37] + "..."
-        pdf.cell(90, 10, version_text, border=1, new_x="LMARGIN", new_y="NEXT")
-        
-    # 3. Create response
-    pdf_bytes = pdf.output()
+    file_path = f"sentinelx_report_{scan_id}.pdf"
+    pdf.output(file_path)
     
-    # Return as a downloadable file
-    return StreamingResponse(
-        io.BytesIO(pdf_bytes), 
-        media_type="application/pdf", 
-        headers={"Content-Disposition": f"attachment; filename=sentinelx_report_{scan.target.ip}.pdf"}
-    )
-
-# To run this server, use the command:
-# uvicorn api:app --reload
+    return FileResponse(path=file_path, filename=file_path, media_type='application/pdf')

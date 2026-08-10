@@ -5,12 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SentinelX | Attack Surface Platform</title>
     
-    <!-- 1. Load React, ReactDOM, and Babel -->
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    
-    <!-- 2. Load Tailwind CSS and Icons -->
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
@@ -26,21 +23,34 @@
         const { useState, useEffect } = React;
 
         function App() {
-            // Tab Navigation State
-            const [activeTab, setActiveTab] = useState('scan'); // 'scan' or 'history'
-
-            // Scan State
+            const [activeTab, setActiveTab] = useState('new');
             const [target, setTarget] = useState('scanme.nmap.org');
             const [isScanning, setIsScanning] = useState(false);
             const [results, setResults] = useState(null);
             const [error, setError] = useState(null);
-
-            // History State
+            
             const [history, setHistory] = useState([]);
             const [isLoadingHistory, setIsLoadingHistory] = useState(false);
-            const [historyResults, setHistoryResults] = useState(null);
 
-            // --- SCANNING LOGIC ---
+            const fetchHistory = async () => {
+                setIsLoadingHistory(true);
+                try {
+                    const response = await fetch('http://localhost:8000/history');
+                    const data = await response.json();
+                    setHistory(data);
+                } catch (err) {
+                    console.error("Failed to load history", err);
+                } finally {
+                    setIsLoadingHistory(false);
+                }
+            };
+
+            useEffect(() => {
+                if (activeTab === 'history') {
+                    fetchHistory();
+                }
+            }, [activeTab]);
+
             const handleScan = async (e) => {
                 e.preventDefault();
                 setIsScanning(true);
@@ -54,165 +64,71 @@
                     setResults(data);
                 } catch (err) {
                     setError("Failed to connect to the SentinelX engine. Is your Python API running?");
-                    console.error(err);
                 } finally {
                     setIsScanning(false);
                 }
             };
 
-            // --- HISTORY LOGIC ---
-            const fetchHistory = async () => {
+            const viewHistoricalScan = async (id) => {
                 setIsLoadingHistory(true);
-                setHistoryResults(null); // Clear previous open history result
                 try {
-                    const response = await fetch(`http://localhost:8000/scans`);
-                    if (!response.ok) throw new Error("Failed to fetch history");
+                    const response = await fetch(`http://localhost:8000/history/${id}`);
                     const data = await response.json();
-                    setHistory(data);
+                    setResults(data);
+                    setActiveTab('new');
                 } catch (err) {
-                    console.error(err);
+                    alert("Failed to fetch scan details");
                 } finally {
                     setIsLoadingHistory(false);
                 }
             };
 
-            const fetchHistoryDetails = async (scanId) => {
-                try {
-                    const response = await fetch(`http://localhost:8000/scans/${scanId}`);
-                    if (!response.ok) throw new Error("Failed to fetch scan details");
-                    const data = await response.json();
-                    // Keep the original scanId in the results object so we can use it for the PDF link
-                    setHistoryResults({ ...data, id: scanId }); 
-                } catch (err) {
-                    console.error(err);
-                }
-            };
-
-            // Switch to history tab and load data automatically
-            const openHistoryTab = () => {
-                setActiveTab('history');
-                fetchHistory();
-            };
-
-            // --- REUSABLE UI COMPONENT FOR RESULTS ---
-            const renderResults = (data) => {
-                if (!data) return null;
-                return (
-                    <div className="animate-fade-in-up mt-8">
-                        <div className="flex justify-between items-end mb-4 border-b border-slate-700 pb-2">
-                            <h2 className="text-xl font-semibold">
-                                Scan Results for <span className="text-blue-400">{data.target_ip}</span> ({data.hostname})
-                            </h2>
-                            
-                            {/* NEW: Download PDF Button (Only shows if we are looking at a history item with an ID) */}
-                            {data.id && (
-                                <a 
-                                    href={`http://localhost:8000/scans/${data.id}/pdf`}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-semibold transition-colors flex items-center shadow-lg"
-                                >
-                                    <i className="fa-solid fa-file-pdf mr-2"></i>
-                                    Download PDF
-                                </a>
-                            )}
-                        </div>
-                        
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {data.services.map((svc, index) => {
-                                const isOpen = svc.state === 'open';
-                                const borderClass = isOpen ? 'border-l-4 border-l-red-500' : 'border-l-4 border-l-slate-600';
-                                
-                                return (
-                                    <div key={index} className={`glass-panel p-5 rounded-lg ${borderClass} flex flex-col justify-between`}>
-                                        <div className="flex justify-between items-start mb-2">
-                                            <div className="font-mono text-lg font-bold">Port {svc.port}</div>
-                                            <div className={`text-xs px-2 py-1 rounded font-bold uppercase ${isOpen ? 'bg-red-500/20 text-red-400' : 'bg-slate-700 text-slate-400'}`}>
-                                                {svc.state}
-                                            </div>
-                                        </div>
-                                        <div>
-                                            <div className="text-sm font-semibold text-slate-300 uppercase tracking-wide">{svc.service}</div>
-                                            <div className="text-sm text-slate-400 mt-1 line-clamp-2" title={svc.version_info}>
-                                                {svc.version_info}
-                                            </div>
-                                        </div>
-                                        
-                                        {/* NEW: Display CVE Badges */}
-                                        {svc.cves && (
-                                            <div className="mt-4 pt-3 border-t border-slate-700/50">
-                                                <div className="text-[10px] font-bold text-red-400 mb-2 tracking-wider flex items-center">
-                                                    <i className="fa-solid fa-bug mr-1.5"></i> KNOWN VULNERABILITIES
-                                                </div>
-                                                <div className="flex flex-wrap gap-1.5">
-                                                    {svc.cves.split(', ').map((cve, i) => (
-                                                        cve.includes('CVE-') ? (
-                                                            <a 
-                                                                key={i} 
-                                                                href={`https://nvd.nist.gov/vuln/detail/${cve}`} 
-                                                                target="_blank" 
-                                                                rel="noopener noreferrer"
-                                                                className="text-xs bg-red-500/10 border border-red-500/30 text-red-300 px-2 py-1 rounded hover:bg-red-500/30 hover:text-white transition-colors shadow-sm"
-                                                            >
-                                                                {cve}
-                                                            </a>
-                                                        ) : (
-                                                            <span key={i} className="text-xs text-slate-400 italic">{cve}</span>
-                                                        )
-                                                    ))}
-                                                </div>
-                                            </div>
-                                        )}
-                                        {/* ------------------------- */}
-                                        
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    </div>
-                );
+            const downloadReport = (scanId) => {
+                window.open(`http://localhost:8000/scans/${scanId}/pdf`, '_blank');
             };
 
             return (
                 <div className="max-w-5xl mx-auto">
-                    {/* Header Section */}
-                    <div className="flex items-center space-x-4 mb-6">
-                        <i className="fa-solid fa-shield-halved text-4xl text-blue-500"></i>
-                        <div>
-                            <h1 className="text-3xl font-bold tracking-tight">SentinelX</h1>
-                            <p className="text-slate-400 text-sm">Automated Attack Surface Assessment</p>
+                    {/* Header */}
+                    <div className="flex items-center justify-between mb-8">
+                        <div className="flex items-center space-x-4">
+                            <i className="fa-solid fa-shield-halved text-4xl text-blue-500"></i>
+                            <div>
+                                <h1 className="text-3xl font-bold tracking-tight">SentinelX</h1>
+                                <p className="text-slate-400 text-sm">Automated Attack Surface Assessment</p>
+                            </div>
                         </div>
                     </div>
 
                     {/* Navigation Tabs */}
-                    <div className="flex border-b border-slate-700 mb-8 space-x-2">
+                    <div className="flex space-x-2 mb-6 border-b border-slate-700 pb-px">
                         <button 
-                            className={`px-4 py-3 font-semibold text-sm transition-colors ${activeTab === 'scan' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-slate-400 hover:text-slate-200'}`}
-                            onClick={() => setActiveTab('scan')}
+                            onClick={() => setActiveTab('new')}
+                            className={`px-4 py-2 font-semibold rounded-t-lg transition-colors ${activeTab === 'new' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
                         >
-                            <i className="fa-solid fa-bolt mr-2"></i> New Scan
+                            <i className="fa-solid fa-crosshairs mr-2"></i>Scanner
                         </button>
                         <button 
-                            className={`px-4 py-3 font-semibold text-sm transition-colors ${activeTab === 'history' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-slate-400 hover:text-slate-200'}`}
-                            onClick={openHistoryTab}
+                            onClick={() => setActiveTab('history')}
+                            className={`px-4 py-2 font-semibold rounded-t-lg transition-colors ${activeTab === 'history' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
                         >
-                            <i className="fa-solid fa-clock-rotate-left mr-2"></i> Scan History
+                            <i className="fa-solid fa-clock-rotate-left mr-2"></i>Scan History
                         </button>
                     </div>
 
-                    {/* TAB 1: NEW SCAN */}
-                    {activeTab === 'scan' && (
-                        <div>
-                            <div className="glass-panel rounded-xl p-6 shadow-xl">
-                                <form onSubmit={handleScan} className="flex space-x-4 mb-4">
+                    {/* Scanner Tab */}
+                    {activeTab === 'new' && (
+                        <>
+                            <div className="glass-panel rounded-xl p-6 mb-8 shadow-xl">
+                                <form onSubmit={handleScan} className="flex space-x-4">
                                     <div className="flex-grow">
                                         <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Target IP or Domain</label>
                                         <input 
                                             type="text" 
                                             value={target}
                                             onChange={(e) => setTarget(e.target.value)}
-                                            className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
-                                            placeholder="e.g., 192.168.1.1 or scanme.nmap.org"
+                                            className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                                            placeholder="e.g., scanme.nmap.org"
                                         />
                                     </div>
                                     <div className="flex items-end">
@@ -220,9 +136,7 @@
                                             type="submit" 
                                             disabled={isScanning}
                                             className={`px-8 py-3 rounded-lg font-bold transition-all shadow-lg flex items-center space-x-2
-                                                ${isScanning 
-                                                    ? 'bg-slate-700 text-slate-400 cursor-not-allowed' 
-                                                    : 'bg-blue-600 hover:bg-blue-500 text-white hover:shadow-blue-500/25'}`}
+                                                ${isScanning ? 'bg-slate-700 text-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500 text-white'}`}
                                         >
                                             {isScanning ? (
                                                 <><i className="fa-solid fa-circle-notch fa-spin"></i><span>Scanning...</span></>
@@ -234,71 +148,132 @@
                                 </form>
                                 {error && <div className="mt-4 text-red-400 text-sm"><i className="fa-solid fa-triangle-exclamation mr-2"></i>{error}</div>}
                             </div>
-                            
-                            {/* Render current scan results */}
-                            {renderResults(results)}
-                        </div>
+
+                            {/* Scan Results */}
+                            {results && (
+                                <div className="animate-fade-in-up">
+                                    <div className="flex justify-between items-end mb-4 border-b border-slate-700 pb-2">
+                                        <h2 className="text-xl font-semibold">
+                                            Results for <span className="text-blue-400">{results.target_ip}</span>
+                                        </h2>
+                                        <button 
+                                            onClick={() => downloadReport(results.scan_id)}
+                                            className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white transition-colors"
+                                        >
+                                            <i className="fa-solid fa-file-pdf mr-2 text-red-400"></i>Download PDF
+                                        </button>
+                                    </div>
+
+                                    {/* PHASE 3: Diff Engine Alerts */}
+                                    {results.changes && !results.changes.is_first_scan && (
+                                        <div className="mb-6 space-y-2">
+                                            {results.changes.new_ports.length > 0 && (
+                                                <div className="bg-red-500/20 border border-red-500 text-red-400 px-4 py-3 rounded-lg flex items-center">
+                                                    <i className="fa-solid fa-triangle-exclamation text-xl mr-3"></i>
+                                                    <div>
+                                                        <span className="font-bold">SECURITY ALERT:</span> New ports have opened since the last scan: {results.changes.new_ports.join(", ")}
+                                                    </div>
+                                                </div>
+                                            )}
+                                            {results.changes.closed_ports.length > 0 && (
+                                                <div className="bg-green-500/20 border border-green-500 text-green-400 px-4 py-3 rounded-lg flex items-center">
+                                                    <i className="fa-solid fa-shield-check text-xl mr-3"></i>
+                                                    <div>
+                                                        <span className="font-bold">STATUS UPDATE:</span> Ports closed since last scan: {results.changes.closed_ports.join(", ")}
+                                                    </div>
+                                                </div>
+                                            )}
+                                            {results.changes.new_ports.length === 0 && results.changes.closed_ports.length === 0 && (
+                                                <div className="bg-blue-500/20 border border-blue-500 text-blue-400 px-4 py-3 rounded-lg flex items-center">
+                                                    <i className="fa-solid fa-check text-xl mr-3"></i>
+                                                    <div>
+                                                        <span className="font-bold">NO CHANGES:</span> Attack surface remains identical to the previous scan.
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        {results.services.map((svc, index) => {
+                                            const isOpen = svc.state === 'open';
+                                            const borderClass = isOpen ? 'border-l-4 border-l-red-500' : 'border-l-4 border-l-slate-600';
+                                            
+                                            return (
+                                                <div key={index} className={`glass-panel p-5 rounded-lg ${borderClass} flex flex-col justify-between`}>
+                                                    <div>
+                                                        <div className="flex justify-between items-start mb-2">
+                                                            <div className="font-mono text-lg font-bold">Port {svc.port}</div>
+                                                            <div className={`text-xs px-2 py-1 rounded font-bold uppercase ${isOpen ? 'bg-red-500/20 text-red-400' : 'bg-slate-700 text-slate-400'}`}>
+                                                                {svc.state}
+                                                            </div>
+                                                        </div>
+                                                        <div className="text-sm font-semibold text-slate-300 uppercase tracking-wide">{svc.service}</div>
+                                                        <div className="text-sm text-slate-400 mt-1">{svc.version_info}</div>
+                                                    </div>
+                                                    
+                                                    {/* CVE Display */}
+                                                    {svc.cves && svc.cves.length > 0 && (
+                                                        <div className="mt-4 pt-3 border-t border-slate-700">
+                                                            <div className="text-xs text-red-400 font-bold mb-2 flex items-center">
+                                                                <i className="fa-solid fa-bug mr-1"></i> KNOWN VULNERABILITIES
+                                                            </div>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                {svc.cves.map(cve => (
+                                                                    <a href={`https://nvd.nist.gov/vuln/detail/${cve}`} target="_blank" key={cve} className="text-xs bg-red-900/50 text-red-300 px-2 py-1 rounded hover:bg-red-800 transition-colors border border-red-800/50">
+                                                                        {cve}
+                                                                    </a>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            )}
+                        </>
                     )}
 
-                    {/* TAB 2: SCAN HISTORY */}
+                    {/* History Tab */}
                     {activeTab === 'history' && (
-                        <div className="animate-fade-in-up">
-                            <div className="glass-panel rounded-xl p-6 shadow-xl mb-8">
-                                <h2 className="text-xl font-bold mb-4 flex items-center">
-                                    <i className="fa-solid fa-database text-slate-400 mr-3"></i> Past Scans Database
-                                </h2>
-                                
-                                {isLoadingHistory ? (
-                                    <div className="text-center py-12 text-slate-400">
-                                        <i className="fa-solid fa-circle-notch fa-spin text-3xl mb-3"></i>
-                                        <p>Fetching database records...</p>
-                                    </div>
-                                ) : history.length === 0 ? (
-                                    <div className="text-center py-12 text-slate-500">
-                                        <i className="fa-solid fa-folder-open text-4xl mb-3 opacity-50"></i>
-                                        <p>No scans found in the database yet.</p>
-                                    </div>
-                                ) : (
-                                    <div className="overflow-x-auto">
-                                        <table className="w-full text-left border-collapse">
-                                            <thead>
-                                                <tr className="border-b-2 border-slate-700 text-slate-400 text-xs uppercase tracking-wider">
-                                                    <th className="pb-3 pr-4 font-semibold">Date & Time</th>
-                                                    <th className="pb-3 pr-4 font-semibold">Target IP</th>
-                                                    <th className="pb-3 pr-4 font-semibold">Hostname</th>
-                                                    <th className="pb-3 font-semibold text-right">Action</th>
+                        <div className="glass-panel rounded-xl shadow-xl overflow-hidden">
+                            {isLoadingHistory ? (
+                                <div className="p-8 text-center text-slate-400"><i className="fa-solid fa-circle-notch fa-spin mr-2"></i>Loading records...</div>
+                            ) : (
+                                <table className="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr className="bg-slate-800 border-b border-slate-700 text-sm tracking-wide text-slate-400 uppercase">
+                                            <th className="p-4 font-semibold">Scan ID</th>
+                                            <th className="p-4 font-semibold">Target IP</th>
+                                            <th className="p-4 font-semibold">Date & Time</th>
+                                            <th className="p-4 font-semibold text-right">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {history.length === 0 ? (
+                                            <tr><td colSpan="4" className="p-4 text-center text-slate-500">No scans found in database.</td></tr>
+                                        ) : (
+                                            history.map((record) => (
+                                                <tr key={record.id} className="border-b border-slate-700 hover:bg-slate-800/50 transition-colors">
+                                                    <td className="p-4 text-slate-300">#{record.id}</td>
+                                                    <td className="p-4 font-mono text-blue-400">{record.target}</td>
+                                                    <td className="p-4 text-slate-400">{new Date(record.time).toLocaleString()}</td>
+                                                    <td className="p-4 text-right">
+                                                        <button 
+                                                            onClick={() => viewHistoricalScan(record.id)}
+                                                            className="text-sm bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded transition-colors"
+                                                        >
+                                                            View Results
+                                                        </button>
+                                                    </td>
                                                 </tr>
-                                            </thead>
-                                            <tbody>
-                                                {history.map(item => (
-                                                    <tr key={item.id} className="border-b border-slate-800 hover:bg-slate-800/50 transition-colors group">
-                                                        <td className="py-4 pr-4 text-sm text-slate-300">
-                                                            {new Date(item.timestamp).toLocaleString()}
-                                                        </td>
-                                                        <td className="py-4 pr-4 text-sm text-blue-400 font-mono">
-                                                            {item.target_ip}
-                                                        </td>
-                                                        <td className="py-4 pr-4 text-sm text-slate-300">
-                                                            {item.hostname || 'Unknown'}
-                                                        </td>
-                                                        <td className="py-4 text-right">
-                                                            <button 
-                                                                onClick={() => fetchHistoryDetails(item.id)}
-                                                                className="px-4 py-1.5 bg-slate-700 hover:bg-blue-600 rounded-md text-xs font-bold transition-colors shadow-sm"
-                                                            >
-                                                                View Results
-                                                            </button>
-                                                        </td>
-                                                    </tr>
-                                                ))}
-                                            </tbody>
-                                        </table>
-                                    </div>
-                                )}
-                            </div>
-
-                            {/* Render selected history results */}
-                            {renderResults(historyResults)}
+                                            ))
+                                        )}
+                                    </tbody>
+                                </table>
+                            )}
                         </div>
                     )}
                 </div>
