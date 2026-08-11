@@ -8,6 +8,8 @@ import requests
 import os
 from fpdf import FPDF
 from fastapi.responses import FileResponse
+from apscheduler.schedulers.background import BackgroundScheduler
+from pydantic import BaseModel
 
 # Database Setup
 SQLALCHEMY_DATABASE_URL = "sqlite:///./sentinelx.db"
@@ -33,13 +35,15 @@ class ServiceDetail(Base):
     state = Column(String)
     service_name = Column(String)
     version_info = Column(String)
-    cves = Column(String) # Store CVEs as comma-separated string
+    cves = Column(String)
     scan = relationship("ScanHistory", back_populates="services")
 
 Base.metadata.create_all(bind=engine)
 
-# Initialize FastAPI
-app = FastAPI(title="SentinelX API", version="0.4")
+# Initialize FastAPI & Scheduler
+app = FastAPI(title="SentinelX API", version="0.5")
+scheduler = BackgroundScheduler()
+scheduler.start()
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +53,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Dependency to get DB session
 def get_db():
     db = SessionLocal()
     try:
@@ -57,129 +60,83 @@ def get_db():
     finally:
         db.close()
 
-# Helper: Fetch CVEs from NVD
 def get_cves_for_service(service_name, version):
-    if not version or len(version) < 2:
-        return []
-    
-    search_query = f"{service_name} {version}"
-    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={search_query}&resultsPerPage=3"
-    
+    if not version or len(version) < 2: return []
+    url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={service_name} {version}&resultsPerPage=3"
     try:
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
-            data = response.json()
-            cve_list = []
-            for vuln in data.get("vulnerabilities", []):
-                cve_id = vuln.get("cve", {}).get("id")
-                if cve_id:
-                    cve_list.append(cve_id)
-            return cve_list
-    except Exception as e:
-        print(f"NVD API Error: {e}")
-    
+            return [v.get("cve", {}).get("id") for v in response.json().get("vulnerabilities", []) if v.get("cve", {}).get("id")]
+    except:
+        pass
     return []
 
-@app.get("/")
-def root():
-    return {"status": "SentinelX API is online", "version": "0.4"}
-
-@app.get("/scan/{target}")
-def scan_target(target: str, db: Session = Depends(get_db)):
+# CORE SCAN FUNCTION - Can be called by API or by Scheduler
+def perform_scan(target: str):
+    print(f"[*] Starting scan on target: {target}")
+    db = SessionLocal() # Open DB session for background task
     nm = nmap.PortScanner()
     try:
-        # Run Nmap scan
         nm.scan(target, arguments='-sV -F')
-    except nmap.PortScannerError:
-        raise HTTPException(status_code=500, detail="Nmap execution failed")
-    
-    if target not in nm.all_hosts():
-        hosts = nm.all_hosts()
-        if not hosts:
-            raise HTTPException(status_code=404, detail="Target not found or down")
-        host = hosts[0]
-    else:
-        host = target
+        host = target if target in nm.all_hosts() else (nm.all_hosts()[0] if nm.all_hosts() else None)
+        if not host:
+            print(f"[-] Scan failed: Target {target} down.")
+            return None
+        
+        hostname = nm[host].hostname() if nm[host].hostname() else host
+        previous_scan = db.query(ScanHistory).filter(ScanHistory.target_ip == host).order_by(ScanHistory.scan_time.desc()).first()
+        previous_ports = [svc.port for svc in previous_scan.services if svc.state == 'open'] if previous_scan else []
 
-    hostname = nm[host].hostname() if nm[host].hostname() else host
-    
-    # 1. NEW PHASE 3: Fetch Previous Scan for Diff Engine
-    previous_scan = db.query(ScanHistory).filter(ScanHistory.target_ip == host).order_by(ScanHistory.scan_time.desc()).first()
-    previous_ports = []
-    if previous_scan:
-        previous_ports = [svc.port for svc in previous_scan.services if svc.state == 'open']
+        db_scan = ScanHistory(target_ip=host, hostname=hostname)
+        db.add(db_scan)
+        db.commit()
+        db.refresh(db_scan)
+        
+        services_data = []
+        current_open_ports = []
 
-    # 2. Save New Scan to Database
-    db_scan = ScanHistory(target_ip=host, hostname=hostname)
-    db.add(db_scan)
-    db.commit()
-    db.refresh(db_scan)
-    
-    services_data = []
-    current_open_ports = []
+        for proto in nm[host].all_protocols():
+            for port in nm[host][proto].keys():
+                state = nm[host][proto][port]['state']
+                name = nm[host][proto][port]['name']
+                full_version = f"{nm[host][proto][port].get('product', '')} {nm[host][proto][port].get('version', '')}".strip()
+                
+                if state == 'open': current_open_ports.append(port)
+                cves_str = ",".join(get_cves_for_service(name, nm[host][proto][port].get('version', ''))) if state == 'open' and full_version else ""
 
-    for proto in nm[host].all_protocols():
-        ports = nm[host][proto].keys()
-        for port in ports:
-            state = nm[host][proto][port]['state']
-            name = nm[host][proto][port]['name']
-            product = nm[host][proto][port].get('product', '')
-            version = nm[host][proto][port].get('version', '')
-            extrainfo = nm[host][proto][port].get('extrainfo', '')
-            
-            full_version = f"{product} {version} {extrainfo}".strip()
-            
-            if state == 'open':
-                current_open_ports.append(port)
-            
-            # Fetch CVEs if port is open
-            cve_list = []
-            if state == 'open' and full_version:
-                cve_list = get_cves_for_service(name, version)
-            
-            cves_str = ",".join(cve_list)
+                svc = ServiceDetail(scan_id=db_scan.id, port=port, protocol=proto, state=state, service_name=name, version_info=full_version, cves=cves_str)
+                db.add(svc)
+                services_data.append({"port": port, "protocol": proto, "state": state, "service": name, "version_info": full_version, "cves": cves_str.split(",") if cves_str else []})
+        
+        db.commit()
+        changes = {"is_first_scan": previous_scan is None, "new_ports": list(set(current_open_ports) - set(previous_ports)), "closed_ports": list(set(previous_ports) - set(current_open_ports))}
+        print(f"[+] Scan completed for {target}")
+        
+        return {"scan_id": db_scan.id, "target_ip": host, "hostname": hostname, "scan_time": db_scan.scan_time.isoformat(), "services": services_data, "changes": changes}
+    finally:
+        db.close() # Always close DB session
 
-            svc = ServiceDetail(
-                scan_id=db_scan.id,
-                port=port,
-                protocol=proto,
-                state=state,
-                service_name=name,
-                version_info=full_version,
-                cves=cves_str
-            )
-            db.add(svc)
-            
-            services_data.append({
-                "port": port,
-                "protocol": proto,
-                "state": state,
-                "service": name,
-                "version_info": full_version,
-                "cves": cve_list
-            })
-    
-    db.commit()
+# API Endpoints
+@app.get("/")
+def root(): return {"status": "SentinelX API is online"}
 
-    # 3. NEW PHASE 3: Calculate Differences
-    changes = {
-        "is_first_scan": previous_scan is None,
-        "new_ports": [],
-        "closed_ports": []
-    }
-    
-    if previous_scan:
-        changes["new_ports"] = list(set(current_open_ports) - set(previous_ports))
-        changes["closed_ports"] = list(set(previous_ports) - set(current_open_ports))
+@app.get("/scan/{target}")
+def api_scan_target(target: str):
+    result = perform_scan(target)
+    if not result: raise HTTPException(status_code=404, detail="Target not found or down")
+    return result
 
-    return {
-        "scan_id": db_scan.id,
-        "target_ip": host,
-        "hostname": hostname,
-        "scan_time": db_scan.scan_time.isoformat(),
-        "services": services_data,
-        "changes": changes
-    }
+# NEW PHASE 4: Schedule Endpoint
+class ScheduleRequest(BaseModel):
+    target: str
+    minutes: int
+
+@app.post("/schedule")
+def schedule_scan(req: ScheduleRequest):
+    job_id = f"scan_{req.target}_{req.minutes}m"
+    # Schedule the perform_scan function to run every X minutes
+    scheduler.add_job(perform_scan, 'interval', minutes=req.minutes, args=[req.target], id=job_id, replace_existing=True)
+    return {"message": f"Successfully scheduled background scan for {req.target} every {req.minutes} minutes.", "job_id": job_id}
 
 @app.get("/history")
 def get_history(db: Session = Depends(get_db)):
@@ -189,59 +146,20 @@ def get_history(db: Session = Depends(get_db)):
 @app.get("/history/{scan_id}")
 def get_scan_result(scan_id: int, db: Session = Depends(get_db)):
     scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id).first()
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
-    
-    services_data = []
-    for svc in scan.services:
-        cve_list = svc.cves.split(",") if svc.cves else []
-        services_data.append({
-            "port": svc.port,
-            "protocol": svc.protocol,
-            "state": svc.state,
-            "service": svc.service_name,
-            "version_info": svc.version_info,
-            "cves": cve_list
-        })
-    
-    return {
-        "scan_id": scan.id,
-        "target_ip": scan.target_ip,
-        "hostname": scan.hostname,
-        "scan_time": scan.scan_time.isoformat(),
-        "services": services_data
-    }
+    return {"scan_id": scan.id, "target_ip": scan.target_ip, "hostname": scan.hostname, "scan_time": scan.scan_time.isoformat(), "services": [{"port": svc.port, "protocol": svc.protocol, "state": svc.state, "service": svc.service_name, "version_info": svc.version_info, "cves": svc.cves.split(",") if svc.cves else []} for svc in scan.services]}
 
 @app.get("/scans/{scan_id}/pdf")
 def download_pdf(scan_id: int, db: Session = Depends(get_db)):
     scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id).first()
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
-    
     pdf = FPDF()
     pdf.add_page()
-    
     pdf.set_font("Arial", 'B', 16)
     pdf.cell(200, 10, txt="SentinelX Security Report", ln=True, align='C')
-    
     pdf.set_font("Arial", '', 12)
-    pdf.cell(200, 10, txt=f"Target: {scan.target_ip} ({scan.hostname})", ln=True)
-    pdf.cell(200, 10, txt=f"Scan Date: {scan.scan_time.strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
-    
+    pdf.cell(200, 10, txt=f"Target: {scan.target_ip}", ln=True)
     pdf.ln(10)
-    
     for svc in scan.services:
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(200, 10, txt=f"Port {svc.port} ({svc.protocol}) - {svc.state.upper()}", ln=True)
-        pdf.set_font("Arial", '', 12)
-        pdf.cell(200, 10, txt=f"Service: {svc.service_name}", ln=True)
-        if svc.version_info:
-            pdf.cell(200, 10, txt=f"Version: {svc.version_info}", ln=True)
-        if svc.cves:
-            pdf.cell(200, 10, txt=f"CVEs: {svc.cves}", ln=True)
-        pdf.ln(5)
-        
+        pdf.cell(200, 10, txt=f"Port {svc.port} - {svc.state.upper()} ({svc.service_name})", ln=True)
     file_path = f"sentinelx_report_{scan_id}.pdf"
     pdf.output(file_path)
-    
     return FileResponse(path=file_path, filename=file_path, media_type='application/pdf')

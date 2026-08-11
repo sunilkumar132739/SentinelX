@@ -25,255 +25,146 @@
         function App() {
             const [activeTab, setActiveTab] = useState('new');
             const [target, setTarget] = useState('scanme.nmap.org');
+            const [scheduleInterval, setScheduleInterval] = useState(60);
             const [isScanning, setIsScanning] = useState(false);
             const [results, setResults] = useState(null);
-            const [error, setError] = useState(null);
+            const [alertMsg, setAlertMsg] = useState(null);
             
             const [history, setHistory] = useState([]);
-            const [isLoadingHistory, setIsLoadingHistory] = useState(false);
 
             const fetchHistory = async () => {
-                setIsLoadingHistory(true);
-                try {
-                    const response = await fetch('http://localhost:8000/history');
-                    const data = await response.json();
-                    setHistory(data);
-                } catch (err) {
-                    console.error("Failed to load history", err);
-                } finally {
-                    setIsLoadingHistory(false);
-                }
+                const res = await fetch('http://localhost:8000/history');
+                setHistory(await res.json());
             };
 
-            useEffect(() => {
-                if (activeTab === 'history') {
-                    fetchHistory();
-                }
-            }, [activeTab]);
+            useEffect(() => { if (activeTab === 'history') fetchHistory(); }, [activeTab]);
 
+            // Manual Scan
             const handleScan = async (e) => {
                 e.preventDefault();
                 setIsScanning(true);
-                setError(null);
                 setResults(null);
-
+                setAlertMsg(null);
                 try {
-                    const response = await fetch(`http://localhost:8000/scan/${target}`);
-                    if (!response.ok) throw new Error(`API returned status: ${response.status}`);
-                    const data = await response.json();
-                    setResults(data);
+                    const res = await fetch(`http://localhost:8000/scan/${target}`);
+                    setResults(await res.json());
                 } catch (err) {
-                    setError("Failed to connect to the SentinelX engine. Is your Python API running?");
+                    setAlertMsg("Error connecting to API");
                 } finally {
                     setIsScanning(false);
                 }
             };
 
-            const viewHistoricalScan = async (id) => {
-                setIsLoadingHistory(true);
+            // NEW PHASE 4: Schedule Scan
+            const handleSchedule = async (e) => {
+                e.preventDefault();
+                setAlertMsg(null);
                 try {
-                    const response = await fetch(`http://localhost:8000/history/${id}`);
-                    const data = await response.json();
-                    setResults(data);
-                    setActiveTab('new');
+                    const res = await fetch('http://localhost:8000/schedule', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ target: target, minutes: parseInt(scheduleInterval) })
+                    });
+                    const data = await res.json();
+                    setAlertMsg({ type: 'success', text: data.message });
                 } catch (err) {
-                    alert("Failed to fetch scan details");
-                } finally {
-                    setIsLoadingHistory(false);
+                    setAlertMsg({ type: 'error', text: "Failed to schedule task." });
                 }
             };
 
-            const downloadReport = (scanId) => {
-                window.open(`http://localhost:8000/scans/${scanId}/pdf`, '_blank');
+            const viewHistoricalScan = async (id) => {
+                const res = await fetch(`http://localhost:8000/history/${id}`);
+                setResults(await res.json());
+                setActiveTab('new');
             };
 
             return (
                 <div className="max-w-5xl mx-auto">
-                    {/* Header */}
-                    <div className="flex items-center justify-between mb-8">
-                        <div className="flex items-center space-x-4">
-                            <i className="fa-solid fa-shield-halved text-4xl text-blue-500"></i>
-                            <div>
-                                <h1 className="text-3xl font-bold tracking-tight">SentinelX</h1>
-                                <p className="text-slate-400 text-sm">Automated Attack Surface Assessment</p>
-                            </div>
+                    <div className="flex items-center space-x-4 mb-8">
+                        <i className="fa-solid fa-shield-halved text-4xl text-blue-500"></i>
+                        <div>
+                            <h1 className="text-3xl font-bold tracking-tight">SentinelX</h1>
+                            <p className="text-slate-400 text-sm">Automated Attack Surface Assessment</p>
                         </div>
                     </div>
 
-                    {/* Navigation Tabs */}
                     <div className="flex space-x-2 mb-6 border-b border-slate-700 pb-px">
-                        <button 
-                            onClick={() => setActiveTab('new')}
-                            className={`px-4 py-2 font-semibold rounded-t-lg transition-colors ${activeTab === 'new' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
-                        >
-                            <i className="fa-solid fa-crosshairs mr-2"></i>Scanner
-                        </button>
-                        <button 
-                            onClick={() => setActiveTab('history')}
-                            className={`px-4 py-2 font-semibold rounded-t-lg transition-colors ${activeTab === 'history' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-slate-200'}`}
-                        >
-                            <i className="fa-solid fa-clock-rotate-left mr-2"></i>Scan History
-                        </button>
+                        <button onClick={() => setActiveTab('new')} className={`px-4 py-2 font-semibold rounded-t-lg ${activeTab === 'new' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}>Scanner</button>
+                        <button onClick={() => setActiveTab('history')} className={`px-4 py-2 font-semibold rounded-t-lg ${activeTab === 'history' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}>Scan History</button>
                     </div>
 
-                    {/* Scanner Tab */}
+                    {alertMsg && (
+                        <div className={`p-4 mb-6 rounded-lg ${alertMsg.type === 'success' ? 'bg-green-500/20 text-green-400 border border-green-500' : 'bg-red-500/20 text-red-400 border border-red-500'}`}>
+                            {alertMsg.text}
+                        </div>
+                    )}
+
                     {activeTab === 'new' && (
                         <>
                             <div className="glass-panel rounded-xl p-6 mb-8 shadow-xl">
-                                <form onSubmit={handleScan} className="flex space-x-4">
-                                    <div className="flex-grow">
-                                        <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Target IP or Domain</label>
-                                        <input 
-                                            type="text" 
-                                            value={target}
-                                            onChange={(e) => setTarget(e.target.value)}
-                                            className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                                            placeholder="e.g., scanme.nmap.org"
-                                        />
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    
+                                    {/* Manual Scan Box */}
+                                    <div className="border-r border-slate-600 pr-6">
+                                        <h3 className="text-lg font-semibold mb-4"><i className="fa-solid fa-hand-pointer mr-2"></i>Run Manual Scan</h3>
+                                        <form onSubmit={handleScan} className="space-y-4">
+                                            <div>
+                                                <label className="block text-xs text-slate-400 uppercase mb-2">Target IP/Domain</label>
+                                                <input type="text" value={target} onChange={(e) => setTarget(e.target.value)} className="w-full bg-slate-800 border border-slate-600 rounded p-2 text-white" />
+                                            </div>
+                                            <button type="submit" disabled={isScanning} className="w-full py-2 bg-blue-600 hover:bg-blue-500 rounded font-bold">
+                                                {isScanning ? "Scanning..." : "Launch Scan Now"}
+                                            </button>
+                                        </form>
                                     </div>
-                                    <div className="flex items-end">
-                                        <button 
-                                            type="submit" 
-                                            disabled={isScanning}
-                                            className={`px-8 py-3 rounded-lg font-bold transition-all shadow-lg flex items-center space-x-2
-                                                ${isScanning ? 'bg-slate-700 text-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-500 text-white'}`}
-                                        >
-                                            {isScanning ? (
-                                                <><i className="fa-solid fa-circle-notch fa-spin"></i><span>Scanning...</span></>
-                                            ) : (
-                                                <><i className="fa-solid fa-bolt"></i><span>Launch Scan</span></>
-                                            )}
-                                        </button>
+
+                                    {/* Automated Schedule Box */}
+                                    <div className="pl-6">
+                                        <h3 className="text-lg font-semibold mb-4 text-purple-400"><i className="fa-solid fa-clock mr-2"></i>Automated Monitoring</h3>
+                                        <form onSubmit={handleSchedule} className="space-y-4">
+                                            <div>
+                                                <label className="block text-xs text-slate-400 uppercase mb-2">Scan Interval (Minutes)</label>
+                                                <input type="number" min="1" value={scheduleInterval} onChange={(e) => setScheduleInterval(e.target.value)} className="w-full bg-slate-800 border border-slate-600 rounded p-2 text-white" />
+                                            </div>
+                                            <button type="submit" className="w-full py-2 bg-purple-600 hover:bg-purple-500 rounded font-bold">
+                                                Schedule Background Scan
+                                            </button>
+                                        </form>
                                     </div>
-                                </form>
-                                {error && <div className="mt-4 text-red-400 text-sm"><i className="fa-solid fa-triangle-exclamation mr-2"></i>{error}</div>}
+
+                                </div>
                             </div>
 
-                            {/* Scan Results */}
+                            {/* Results Display */}
                             {results && (
                                 <div className="animate-fade-in-up">
-                                    <div className="flex justify-between items-end mb-4 border-b border-slate-700 pb-2">
-                                        <h2 className="text-xl font-semibold">
-                                            Results for <span className="text-blue-400">{results.target_ip}</span>
-                                        </h2>
-                                        <button 
-                                            onClick={() => downloadReport(results.scan_id)}
-                                            className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-sm text-white transition-colors"
-                                        >
-                                            <i className="fa-solid fa-file-pdf mr-2 text-red-400"></i>Download PDF
-                                        </button>
-                                    </div>
-
-                                    {/* PHASE 3: Diff Engine Alerts */}
-                                    {results.changes && !results.changes.is_first_scan && (
-                                        <div className="mb-6 space-y-2">
-                                            {results.changes.new_ports.length > 0 && (
-                                                <div className="bg-red-500/20 border border-red-500 text-red-400 px-4 py-3 rounded-lg flex items-center">
-                                                    <i className="fa-solid fa-triangle-exclamation text-xl mr-3"></i>
-                                                    <div>
-                                                        <span className="font-bold">SECURITY ALERT:</span> New ports have opened since the last scan: {results.changes.new_ports.join(", ")}
-                                                    </div>
-                                                </div>
-                                            )}
-                                            {results.changes.closed_ports.length > 0 && (
-                                                <div className="bg-green-500/20 border border-green-500 text-green-400 px-4 py-3 rounded-lg flex items-center">
-                                                    <i className="fa-solid fa-shield-check text-xl mr-3"></i>
-                                                    <div>
-                                                        <span className="font-bold">STATUS UPDATE:</span> Ports closed since last scan: {results.changes.closed_ports.join(", ")}
-                                                    </div>
-                                                </div>
-                                            )}
-                                            {results.changes.new_ports.length === 0 && results.changes.closed_ports.length === 0 && (
-                                                <div className="bg-blue-500/20 border border-blue-500 text-blue-400 px-4 py-3 rounded-lg flex items-center">
-                                                    <i className="fa-solid fa-check text-xl mr-3"></i>
-                                                    <div>
-                                                        <span className="font-bold">NO CHANGES:</span> Attack surface remains identical to the previous scan.
-                                                    </div>
-                                                </div>
-                                            )}
-                                        </div>
-                                    )}
-
+                                    <h2 className="text-xl font-semibold mb-4 border-b border-slate-700 pb-2">Results for {results.target_ip}</h2>
                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                        {results.services.map((svc, index) => {
-                                            const isOpen = svc.state === 'open';
-                                            const borderClass = isOpen ? 'border-l-4 border-l-red-500' : 'border-l-4 border-l-slate-600';
-                                            
-                                            return (
-                                                <div key={index} className={`glass-panel p-5 rounded-lg ${borderClass} flex flex-col justify-between`}>
-                                                    <div>
-                                                        <div className="flex justify-between items-start mb-2">
-                                                            <div className="font-mono text-lg font-bold">Port {svc.port}</div>
-                                                            <div className={`text-xs px-2 py-1 rounded font-bold uppercase ${isOpen ? 'bg-red-500/20 text-red-400' : 'bg-slate-700 text-slate-400'}`}>
-                                                                {svc.state}
-                                                            </div>
-                                                        </div>
-                                                        <div className="text-sm font-semibold text-slate-300 uppercase tracking-wide">{svc.service}</div>
-                                                        <div className="text-sm text-slate-400 mt-1">{svc.version_info}</div>
-                                                    </div>
-                                                    
-                                                    {/* CVE Display */}
-                                                    {svc.cves && svc.cves.length > 0 && (
-                                                        <div className="mt-4 pt-3 border-t border-slate-700">
-                                                            <div className="text-xs text-red-400 font-bold mb-2 flex items-center">
-                                                                <i className="fa-solid fa-bug mr-1"></i> KNOWN VULNERABILITIES
-                                                            </div>
-                                                            <div className="flex flex-wrap gap-2">
-                                                                {svc.cves.map(cve => (
-                                                                    <a href={`https://nvd.nist.gov/vuln/detail/${cve}`} target="_blank" key={cve} className="text-xs bg-red-900/50 text-red-300 px-2 py-1 rounded hover:bg-red-800 transition-colors border border-red-800/50">
-                                                                        {cve}
-                                                                    </a>
-                                                                ))}
-                                                            </div>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            );
-                                        })}
+                                        {results.services.map((svc, i) => (
+                                            <div key={i} className="glass-panel p-5 rounded-lg border-l-4 border-l-blue-500">
+                                                <div className="font-mono text-lg font-bold">Port {svc.port}</div>
+                                                <div className="text-sm text-slate-400">{svc.service} {svc.version_info}</div>
+                                            </div>
+                                        ))}
                                     </div>
                                 </div>
                             )}
                         </>
                     )}
 
-                    {/* History Tab */}
                     {activeTab === 'history' && (
-                        <div className="glass-panel rounded-xl shadow-xl overflow-hidden">
-                            {isLoadingHistory ? (
-                                <div className="p-8 text-center text-slate-400"><i className="fa-solid fa-circle-notch fa-spin mr-2"></i>Loading records...</div>
-                            ) : (
-                                <table className="w-full text-left border-collapse">
-                                    <thead>
-                                        <tr className="bg-slate-800 border-b border-slate-700 text-sm tracking-wide text-slate-400 uppercase">
-                                            <th className="p-4 font-semibold">Scan ID</th>
-                                            <th className="p-4 font-semibold">Target IP</th>
-                                            <th className="p-4 font-semibold">Date & Time</th>
-                                            <th className="p-4 font-semibold text-right">Actions</th>
+                        <div className="glass-panel rounded-xl shadow-xl overflow-hidden p-4">
+                            <table className="w-full text-left">
+                                <thead><tr className="border-b border-slate-700 text-slate-400"><th className="pb-2">ID</th><th className="pb-2">Target</th><th className="pb-2">Date</th><th className="pb-2">Actions</th></tr></thead>
+                                <tbody>
+                                    {history.map(r => (
+                                        <tr key={r.id} className="border-b border-slate-800">
+                                            <td className="py-3">#{r.id}</td><td className="py-3">{r.target}</td><td className="py-3">{new Date(r.time).toLocaleString()}</td>
+                                            <td><button onClick={() => viewHistoricalScan(r.id)} className="bg-slate-700 px-3 py-1 rounded text-sm">View</button></td>
                                         </tr>
-                                    </thead>
-                                    <tbody>
-                                        {history.length === 0 ? (
-                                            <tr><td colSpan="4" className="p-4 text-center text-slate-500">No scans found in database.</td></tr>
-                                        ) : (
-                                            history.map((record) => (
-                                                <tr key={record.id} className="border-b border-slate-700 hover:bg-slate-800/50 transition-colors">
-                                                    <td className="p-4 text-slate-300">#{record.id}</td>
-                                                    <td className="p-4 font-mono text-blue-400">{record.target}</td>
-                                                    <td className="p-4 text-slate-400">{new Date(record.time).toLocaleString()}</td>
-                                                    <td className="p-4 text-right">
-                                                        <button 
-                                                            onClick={() => viewHistoricalScan(record.id)}
-                                                            className="text-sm bg-slate-700 hover:bg-slate-600 text-white px-3 py-1 rounded transition-colors"
-                                                        >
-                                                            View Results
-                                                        </button>
-                                                    </td>
-                                                </tr>
-                                            ))
-                                        )}
-                                    </tbody>
-                                </table>
-                            )}
+                                    ))}
+                                </tbody>
+                            </table>
                         </div>
                     )}
                 </div>
