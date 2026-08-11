@@ -12,6 +12,7 @@ from fpdf import FPDF
 from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from pydantic import BaseModel
+from typing import Optional
 
 # --- Security Configuration ---
 SECRET_KEY = "super_secret_sentinelx_key_change_in_production"
@@ -37,8 +38,9 @@ class ScanHistory(Base):
     id = Column(Integer, primary_key=True, index=True)
     target_ip = Column(String, index=True)
     hostname = Column(String)
-    scan_time = Column(DateTime, default=datetime.datetime.utcnow)
-    services = relationship("ServiceDetail", back_populates="scan")
+    scan_type = Column(String, default="manual") # 'manual' or 'automated'
+    scan_time = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc))
+    services = relationship("ServiceDetail", back_populates="scan", cascade="all, delete-orphan")
 
 class ServiceDetail(Base):
     __tablename__ = "service_details"
@@ -55,7 +57,7 @@ class ServiceDetail(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- Initialize FastAPI & Scheduler ---
-app = FastAPI(title="SentinelX API (Secured)", version="1.0")
+app = FastAPI(title="SentinelX API (Secured)", version="1.2")
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -83,7 +85,7 @@ def get_password_hash(password):
 
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+    expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -141,7 +143,7 @@ def get_cves_for_service(service_name, version):
         pass
     return []
 
-def perform_scan(target: str):
+def perform_scan(target: str, scan_type: str = "manual"):
     db = SessionLocal()
     nm = nmap.PortScanner()
     try:
@@ -152,7 +154,7 @@ def perform_scan(target: str):
         previous_scan = db.query(ScanHistory).filter(ScanHistory.target_ip == host).order_by(ScanHistory.scan_time.desc()).first()
         previous_ports = [svc.port for svc in previous_scan.services if svc.state == 'open'] if previous_scan else []
 
-        db_scan = ScanHistory(target_ip=host, hostname=hostname)
+        db_scan = ScanHistory(target_ip=host, hostname=hostname, scan_type=scan_type)
         db.add(db_scan)
         db.commit()
         db.refresh(db_scan)
@@ -173,41 +175,70 @@ def perform_scan(target: str):
                 services_data.append({"port": port, "protocol": proto, "state": state, "service": name, "version_info": full_version, "cves": cves_str.split(",") if cves_str else []})
         db.commit()
         changes = {"is_first_scan": previous_scan is None, "new_ports": list(set(current_open_ports) - set(previous_ports)), "closed_ports": list(set(previous_ports) - set(current_open_ports))}
-        return {"scan_id": db_scan.id, "target_ip": host, "hostname": hostname, "scan_time": db_scan.scan_time.isoformat(), "services": services_data, "changes": changes}
+        return {"scan_id": db_scan.id, "target_ip": host, "hostname": hostname, "scan_time": db_scan.scan_time.isoformat() + "Z", "services": services_data, "changes": changes}
     finally:
         db.close()
 
-# --- Protected API Endpoints (Require get_current_user) ---
+# --- Protected API Endpoints ---
 
 @app.get("/scan/{target}")
 def api_scan_target(target: str, current_user: User = Depends(get_current_user)):
-    result = perform_scan(target)
+    result = perform_scan(target, scan_type="manual")
     if not result: raise HTTPException(status_code=404, detail="Target down")
     return result
 
 class ScheduleRequest(BaseModel):
     target: str
-    minutes: int
+    schedule_type: str = "interval" # "interval" or "datetime"
+    minutes: Optional[int] = 60
+    run_at: Optional[str] = None # ISO format string from datetime-local input
 
 @app.post("/schedule")
 def schedule_scan(req: ScheduleRequest, current_user: User = Depends(get_current_user)):
-    job_id = f"scan_{req.target}_{req.minutes}m"
-    scheduler.add_job(perform_scan, 'interval', minutes=req.minutes, args=[req.target], id=job_id, replace_existing=True)
-    return {"message": f"Successfully scheduled scan for {req.target}", "job_id": job_id}
+    if req.schedule_type == "datetime":
+        if not req.run_at:
+            raise HTTPException(status_code=400, detail="Specific date and time (run_at) is required.")
+        try:
+            run_date_dt = datetime.datetime.fromisoformat(req.run_at)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date-time format provided.")
+        
+        job_id = f"scan_{req.target}_once_{req.run_at}"
+        scheduler.add_job(perform_scan, 'date', run_date=run_date_dt, args=[req.target, "automated"], id=job_id, replace_existing=True)
+        formatted_time = run_date_dt.strftime("%d %b %Y at %I:%M %p")
+        return {"message": f"Successfully scheduled one-time scan for {req.target} on {formatted_time}", "job_id": job_id}
+    else:
+        job_id = f"scan_{req.target}_{req.minutes}m"
+        scheduler.add_job(perform_scan, 'interval', minutes=req.minutes or 60, args=[req.target, "automated"], id=job_id, replace_existing=True)
+        return {"message": f"Successfully scheduled recurring scan for {req.target} every {req.minutes} minutes.", "job_id": job_id}
 
 @app.get("/history")
 def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     scans = db.query(ScanHistory).order_by(ScanHistory.scan_time.desc()).all()
-    return [{"id": s.id, "target": s.target_ip, "time": s.scan_time.isoformat()} for s in scans]
+    return [{"id": s.id, "target": s.target_ip, "time": s.scan_time.isoformat() + "Z", "scan_type": s.scan_type} for s in scans]
 
 @app.get("/history/{scan_id}")
 def get_scan_result(scan_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id).first()
-    return {"scan_id": scan.id, "target_ip": scan.target_ip, "hostname": scan.hostname, "scan_time": scan.scan_time.isoformat(), "services": [{"port": svc.port, "protocol": svc.protocol, "state": svc.state, "service": svc.service_name, "version_info": svc.version_info, "cves": svc.cves.split(",") if svc.cves else []} for svc in scan.services]}
+    if not scan: raise HTTPException(status_code=404, detail="Scan not found")
+    return {"scan_id": scan.id, "target_ip": scan.target_ip, "hostname": scan.hostname, "scan_time": scan.scan_time.isoformat() + "Z", "scan_type": scan.scan_type, "services": [{"port": svc.port, "protocol": svc.protocol, "state": svc.state, "service": svc.service_name, "version_info": svc.version_info, "cves": svc.cves.split(",") if svc.cves else []} for svc in scan.services]}
+
+@app.delete("/history")
+def clear_all_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    db.query(ScanHistory).delete()
+    db.commit()
+    return {"message": "All history cleared"}
+
+@app.delete("/history/{scan_id}")
+def delete_single_scan(scan_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id).first()
+    if scan:
+        db.delete(scan)
+        db.commit()
+    return {"message": "Scan deleted"}
 
 @app.get("/scans/{scan_id}/pdf")
 def download_pdf(scan_id: int, db: Session = Depends(get_db)):
-    # PDF route left public for easy downloading in browser, but can be secured as well!
     scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id).first()
     pdf = FPDF()
     pdf.add_page()
@@ -215,6 +246,7 @@ def download_pdf(scan_id: int, db: Session = Depends(get_db)):
     pdf.cell(200, 10, txt="SentinelX Security Report", ln=True, align='C')
     pdf.set_font("Arial", '', 12)
     pdf.cell(200, 10, txt=f"Target: {scan.target_ip}", ln=True)
+    pdf.cell(200, 10, txt=f"Scan Type: {scan.scan_type.upper()}", ln=True)
     for svc in scan.services:
         pdf.cell(200, 10, txt=f"Port {svc.port} - {svc.state.upper()} ({svc.service_name})", ln=True)
     file_path = f"sentinelx_report_{scan_id}.pdf"
