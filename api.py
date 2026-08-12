@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Body
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
@@ -13,6 +13,12 @@ from fastapi.responses import FileResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from pydantic import BaseModel
 from typing import Optional
+import socket
+import ssl
+import json
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Security Configuration ---
 SECRET_KEY = "super_secret_sentinelx_key_change_in_production"
@@ -26,14 +32,13 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- Database Models ---
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     email = Column(String, unique=True, index=True) 
     hashed_password = Column(String)
-    avatar_data = Column(String, nullable=True) # NEW: Stores Base64 Profile Picture
+    avatar_data = Column(String, nullable=True)
     scans = relationship("ScanHistory", back_populates="owner")
 
 class ScanHistory(Base):
@@ -57,12 +62,13 @@ class ServiceDetail(Base):
     service_name = Column(String)
     version_info = Column(String)
     cves = Column(String)
+    web_info = Column(String, nullable=True)
     scan = relationship("ScanHistory", back_populates="services")
 
 Base.metadata.create_all(bind=engine)
 
 # --- Initialize FastAPI & Scheduler ---
-app = FastAPI(title="SentinelX API (Multi-Tenant)", version="1.4")
+app = FastAPI(title="SentinelX API", version="2.2")
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -156,7 +162,7 @@ def update_avatar(avatar: AvatarUpdate, current_user: User = Depends(get_current
     db.commit()
     return {"message": "Profile picture updated successfully"}
 
-# --- Utility Functions ---
+# --- Utility & Risk Engine Functions ---
 def get_cves_for_service(service_name, version):
     if not version or len(version) < 2: return []
     url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={service_name} {version}&resultsPerPage=3"
@@ -164,9 +170,92 @@ def get_cves_for_service(service_name, version):
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             return [v.get("cve", {}).get("id") for v in response.json().get("vulnerabilities", []) if v.get("cve", {}).get("id")]
-    except:
-        pass
+    except: pass
     return []
+
+def analyze_web_target(ip, port):
+    web_data = {}
+    scheme = "https" if port in [443, 8443] else "http"
+    url = f"{scheme}://{ip}:{port}"
+    try:
+        r = requests.get(url, timeout=3, verify=False)
+        web_data["headers"] = {
+            "Strict-Transport-Security": r.headers.get("Strict-Transport-Security", "Missing"),
+            "Content-Security-Policy": r.headers.get("Content-Security-Policy", "Missing"),
+            "X-Frame-Options": r.headers.get("X-Frame-Options", "Missing"),
+            "Server": r.headers.get("Server", "Unknown")
+        }
+    except: pass
+
+    if scheme == "https":
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_OPTIONAL
+            with socket.create_connection((ip, port), timeout=3) as sock:
+                with ctx.wrap_socket(sock, server_hostname=ip) as ssock:
+                    cert = ssock.getpeercert()
+                    if cert:
+                        issuer = dict(x[0] for x in cert.get('issuer', []))
+                        web_data["tls"] = {
+                            "issuer": issuer.get('organizationName', issuer.get('commonName', 'Unknown')),
+                            "expires": cert.get('notAfter', 'Unknown')
+                        }
+        except Exception as e:
+            web_data["tls"] = {"error": "Invalid or inaccessible certificate"}
+    return json.dumps(web_data) if web_data else None
+
+def calculate_risk_metrics(services):
+    score = 100
+    remediations = []
+    high_risk_ports = {
+        21: ("FTP", "Disable unencrypted FTP and migrate to SFTP/SSH."),
+        23: ("Telnet", "Disable Telnet immediately; plaintext authentication is exposed."),
+        80: ("HTTP", "Enforce HTTPS redirect and install SSL/TLS certificate."),
+        3389: ("RDP", "Restrict RDP access via VPN or IP whitelisting."),
+        5900: ("VNC", "Secure VNC with strong authentication or SSH tunneling."),
+        3306: ("MySQL", "Ensure MySQL is not exposed publicly to the internet."),
+        5432: ("PostgreSQL", "Restrict PostgreSQL access to local/trusted IPs only."),
+        27017: ("MongoDB", "Disable public MongoDB access and enable authentication.")
+    }
+    cve_count = 0
+    for svc in services:
+        if svc["state"] == "open":
+            port = svc["port"]
+            if port in high_risk_ports:
+                score -= 15
+                remediations.append(f"Port {port} ({high_risk_ports[port][0]}): {high_risk_ports[port][1]}")
+            else:
+                score -= 3
+
+            cves = svc.get("cves", [])
+            if cves:
+                cve_count += len(cves)
+                score -= (len(cves) * 10)
+                remediations.append(f"Port {port} ({svc['service']}): Patch software version to resolve CVEs ({', '.join(cves)}).")
+
+            web_info = svc.get("web_info")
+            if web_info and isinstance(web_info, dict):
+                headers = web_info.get("headers", {})
+                missing_headers = [k for k, v in headers.items() if v == "Missing"]
+                if missing_headers:
+                    score -= (len(missing_headers) * 2)
+                    remediations.append(f"Port {port} (Web): Missing security headers ({', '.join(missing_headers)}). Implement to prevent XSS/Clickjacking.")
+                
+                tls = web_info.get("tls", {})
+                if tls and tls.get("error"):
+                    score -= 10
+                    remediations.append(f"Port {port} (TLS): Invalid or inaccessible SSL/TLS certificate detected.")
+
+    score = max(0, min(100, score))
+    risk_level = "LOW" if score >= 85 else "MEDIUM" if score >= 65 else "HIGH" if score >= 45 else "CRITICAL"
+
+    return {
+        "security_score": score,
+        "risk_level": risk_level,
+        "total_cves": cve_count,
+        "remediations": remediations
+    }
 
 def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
     db = SessionLocal()
@@ -196,12 +285,31 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
                 if state == 'open': current_open_ports.append(port)
                 cves_str = ",".join(get_cves_for_service(name, nm[host][proto][port].get('version', ''))) if state == 'open' and full_version else ""
 
-                svc = ServiceDetail(scan_id=db_scan.id, port=port, protocol=proto, state=state, service_name=name, version_info=full_version, cves=cves_str)
+                web_info_json = None
+                if state == 'open' and (port in [80, 443, 8080, 8443] or 'http' in name):
+                    web_info_json = analyze_web_target(host, port)
+
+                svc = ServiceDetail(
+                    scan_id=db_scan.id, port=port, protocol=proto, state=state, service_name=name, 
+                    version_info=full_version, cves=cves_str, web_info=web_info_json
+                )
                 db.add(svc)
-                services_data.append({"port": port, "protocol": proto, "state": state, "service": name, "version_info": full_version, "cves": cves_str.split(",") if cves_str else []})
+                
+                web_info_dict = json.loads(web_info_json) if web_info_json else None
+                services_data.append({
+                    "port": port, "protocol": proto, "state": state, "service": name, "version_info": full_version, 
+                    "cves": cves_str.split(",") if cves_str else [], "web_info": web_info_dict
+                })
+        
         db.commit()
+
         changes = {"is_first_scan": previous_scan is None, "new_ports": list(set(current_open_ports) - set(previous_ports)), "closed_ports": list(set(previous_ports) - set(current_open_ports))}
-        return {"scan_id": db_scan.id, "target_ip": host, "hostname": hostname, "scan_time": db_scan.scan_time.isoformat() + "Z", "services": services_data, "changes": changes}
+        risk_metrics = calculate_risk_metrics(services_data)
+
+        return {
+            "scan_id": db_scan.id, "target_ip": host, "hostname": hostname, "scan_time": db_scan.scan_time.isoformat() + "Z",
+            "services": services_data, "changes": changes, "risk_metrics": risk_metrics
+        }
     finally:
         db.close()
 
@@ -222,12 +330,9 @@ class ScheduleRequest(BaseModel):
 @app.post("/schedule")
 def schedule_scan(req: ScheduleRequest, current_user: User = Depends(get_current_user)):
     if req.schedule_type == "datetime":
-        if not req.run_at:
-            raise HTTPException(status_code=400, detail="Specific date and time is required.")
-        try:
-            run_date_dt = datetime.datetime.fromisoformat(req.run_at)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid date-time format.")
+        if not req.run_at: raise HTTPException(status_code=400, detail="Specific date and time is required.")
+        try: run_date_dt = datetime.datetime.fromisoformat(req.run_at)
+        except ValueError: raise HTTPException(status_code=400, detail="Invalid date-time format.")
         
         job_id = f"scan_{req.target}_once_{req.run_at}_{current_user.id}"
         scheduler.add_job(perform_scan, 'date', run_date=run_date_dt, args=[req.target, current_user.id, "automated"], id=job_id, replace_existing=True)
@@ -238,6 +343,31 @@ def schedule_scan(req: ScheduleRequest, current_user: User = Depends(get_current
         scheduler.add_job(perform_scan, 'interval', minutes=req.minutes or 60, args=[req.target, current_user.id, "automated"], id=job_id, replace_existing=True)
         return {"message": f"Successfully scheduled recurring scan for {req.target} every {req.minutes} minutes.", "job_id": job_id}
 
+# --- NEW: Endpoints to manage active background jobs ---
+@app.get("/schedules")
+def get_schedules(current_user: User = Depends(get_current_user)):
+    jobs = scheduler.get_jobs()
+    user_jobs = []
+    for job in jobs:
+        # Check if job belongs to current user
+        if job.id.endswith(f"_{current_user.id}"):
+            user_jobs.append({
+                "id": job.id,
+                "target": job.args[0], # Target is the first argument passed to perform_scan
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else "Running now"
+            })
+    return user_jobs
+
+@app.delete("/schedules/{job_id}")
+def delete_schedule(job_id: str, current_user: User = Depends(get_current_user)):
+    if not job_id.endswith(f"_{current_user.id}"):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        scheduler.remove_job(job_id)
+        return {"message": "Automated task terminated successfully."}
+    except Exception:
+        raise HTTPException(status_code=404, detail="Active task not found. It may have already completed.")
+
 @app.get("/history")
 def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     scans = db.query(ScanHistory).filter(ScanHistory.owner_id == current_user.id).order_by(ScanHistory.scan_time.desc()).all()
@@ -247,7 +377,22 @@ def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_
 def get_scan_result(scan_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id, ScanHistory.owner_id == current_user.id).first()
     if not scan: raise HTTPException(status_code=404, detail="Scan not found or unauthorized")
-    return {"scan_id": scan.id, "target_ip": scan.target_ip, "hostname": scan.hostname, "scan_time": scan.scan_time.isoformat() + "Z", "scan_type": scan.scan_type, "services": [{"port": svc.port, "protocol": svc.protocol, "state": svc.state, "service": svc.service_name, "version_info": svc.version_info, "cves": svc.cves.split(",") if svc.cves else []} for svc in scan.services]}
+    
+    services_data = []
+    for svc in scan.services:
+        web_info_dict = json.loads(svc.web_info) if svc.web_info else None
+        services_data.append({
+            "port": svc.port, "protocol": svc.protocol, "state": svc.state, "service": svc.service_name, 
+            "version_info": svc.version_info, "cves": svc.cves.split(",") if svc.cves else [], "web_info": web_info_dict
+        })
+        
+    risk_metrics = calculate_risk_metrics(services_data)
+
+    return {
+        "scan_id": scan.id, "target_ip": scan.target_ip, "hostname": scan.hostname,
+        "scan_time": scan.scan_time.isoformat() + "Z", "scan_type": scan.scan_type,
+        "services": services_data, "risk_metrics": risk_metrics
+    }
 
 @app.delete("/history")
 def clear_all_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -267,15 +412,35 @@ def delete_single_scan(scan_id: int, db: Session = Depends(get_db), current_user
 def download_pdf(scan_id: int, db: Session = Depends(get_db)):
     scan = db.query(ScanHistory).filter(ScanHistory.id == scan_id).first()
     if not scan: raise HTTPException(status_code=404, detail="Scan not found")
+    
+    services_data = [{"port": svc.port, "state": svc.state, "service": svc.service_name, "cves": svc.cves.split(",") if svc.cves else [], "web_info": json.loads(svc.web_info) if svc.web_info else None} for svc in scan.services]
+    metrics = calculate_risk_metrics(services_data)
+
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
-    pdf.cell(200, 10, txt="SentinelX Security Report", ln=True, align='C')
+    pdf.cell(200, 10, txt="SentinelX Security Assessment Report", ln=True, align='C')
     pdf.set_font("Arial", '', 12)
     pdf.cell(200, 10, txt=f"Target: {scan.target_ip}", ln=True)
-    pdf.cell(200, 10, txt=f"Scan Type: {scan.scan_type.upper()}", ln=True)
+    pdf.cell(200, 10, txt=f"Security Score: {metrics['security_score']}/100 ({metrics['risk_level']} RISK)", ln=True)
+    pdf.ln(5)
+
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(200, 10, txt="Discovered Services:", ln=True)
+    pdf.set_font("Arial", '', 11)
     for svc in scan.services:
-        pdf.cell(200, 10, txt=f"Port {svc.port} - {svc.state.upper()} ({svc.service_name})", ln=True)
+        pdf.cell(200, 8, txt=f" - Port {svc.port} ({svc.service_name}): {svc.state.upper()} | Version: {svc.version_info or 'N/A'}", ln=True)
+        if svc.cves:
+            pdf.cell(200, 6, txt=f"   CVEs: {svc.cves}", ln=True)
+
+    if metrics["remediations"]:
+        pdf.ln(5)
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(200, 10, txt="Remediation Recommendations:", ln=True)
+        pdf.set_font("Arial", '', 10)
+        for rem in metrics["remediations"]:
+            pdf.multi_cell(0, 6, txt=f" * {rem}")
+
     file_path = f"sentinelx_report_{scan_id}.pdf"
     pdf.output(file_path)
     return FileResponse(path=file_path, filename=file_path, media_type='application/pdf')
