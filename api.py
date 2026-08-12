@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
@@ -31,14 +31,15 @@ class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
-    email = Column(String, unique=True, index=True) # NEW: Added Email
+    email = Column(String, unique=True, index=True) 
     hashed_password = Column(String)
+    avatar_data = Column(String, nullable=True) # NEW: Stores Base64 Profile Picture
     scans = relationship("ScanHistory", back_populates="owner")
 
 class ScanHistory(Base):
     __tablename__ = "scan_history"
     id = Column(Integer, primary_key=True, index=True)
-    owner_id = Column(Integer, ForeignKey("users.id")) # NEW: Links scan to a user
+    owner_id = Column(Integer, ForeignKey("users.id")) 
     target_ip = Column(String, index=True)
     hostname = Column(String)
     scan_type = Column(String, default="manual")
@@ -61,7 +62,7 @@ class ServiceDetail(Base):
 Base.metadata.create_all(bind=engine)
 
 # --- Initialize FastAPI & Scheduler ---
-app = FastAPI(title="SentinelX API (Multi-Tenant)", version="1.3")
+app = FastAPI(title="SentinelX API (Multi-Tenant)", version="1.4")
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -111,7 +112,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise credentials_exception
     return user
 
-# --- Auth Endpoints ---
+# --- Auth & Profile Endpoints ---
 class UserCreate(BaseModel):
     username: str
     email: str
@@ -138,14 +139,22 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
 @app.get("/users/me")
 def read_users_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Returns profile info + total scans
     total_scans = db.query(ScanHistory).filter(ScanHistory.owner_id == current_user.id).count()
     return {
         "username": current_user.username,
         "email": current_user.email,
-        "total_scans": total_scans,
-        "member_since": "August 2026"
+        "avatar_data": current_user.avatar_data,
+        "total_scans": total_scans
     }
+
+class AvatarUpdate(BaseModel):
+    avatar_data: str
+
+@app.put("/users/me/avatar")
+def update_avatar(avatar: AvatarUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    current_user.avatar_data = avatar.avatar_data
+    db.commit()
+    return {"message": "Profile picture updated successfully"}
 
 # --- Utility Functions ---
 def get_cves_for_service(service_name, version):
@@ -159,7 +168,6 @@ def get_cves_for_service(service_name, version):
         pass
     return []
 
-# NEW: Added owner_id parameter so scans are assigned to the correct user
 def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
     db = SessionLocal()
     nm = nmap.PortScanner()
@@ -169,7 +177,6 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
         if not host: return None
         hostname = nm[host].hostname() if nm[host].hostname() else host
         
-        # Only compare with previous scans owned by this user
         previous_scan = db.query(ScanHistory).filter(ScanHistory.target_ip == host, ScanHistory.owner_id == owner_id).order_by(ScanHistory.scan_time.desc()).first()
         previous_ports = [svc.port for svc in previous_scan.services if svc.state == 'open'] if previous_scan else []
 
@@ -223,17 +230,14 @@ def schedule_scan(req: ScheduleRequest, current_user: User = Depends(get_current
             raise HTTPException(status_code=400, detail="Invalid date-time format.")
         
         job_id = f"scan_{req.target}_once_{req.run_at}_{current_user.id}"
-        # Passing current_user.id to background job
         scheduler.add_job(perform_scan, 'date', run_date=run_date_dt, args=[req.target, current_user.id, "automated"], id=job_id, replace_existing=True)
         formatted_time = run_date_dt.strftime("%d %b %Y at %I:%M %p")
         return {"message": f"Successfully scheduled one-time scan for {req.target} on {formatted_time}", "job_id": job_id}
     else:
         job_id = f"scan_{req.target}_{req.minutes}m_{current_user.id}"
-        # Passing current_user.id to background job
         scheduler.add_job(perform_scan, 'interval', minutes=req.minutes or 60, args=[req.target, current_user.id, "automated"], id=job_id, replace_existing=True)
         return {"message": f"Successfully scheduled recurring scan for {req.target} every {req.minutes} minutes.", "job_id": job_id}
 
-# ALL history endpoints now filter by owner_id
 @app.get("/history")
 def get_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     scans = db.query(ScanHistory).filter(ScanHistory.owner_id == current_user.id).order_by(ScanHistory.scan_time.desc()).all()

@@ -44,23 +44,19 @@
         const { useState, useEffect, useMemo } = React;
 
         function App() {
-            // --- Global State ---
             const [isDarkMode, setIsDarkMode] = useState(true);
             const [language, setLanguage] = useState('en');
             const [isSettingsOpen, setIsSettingsOpen] = useState(false);
             
-            // --- Auth State ---
             const [token, setToken] = useState(localStorage.getItem('token'));
             const [authMode, setAuthMode] = useState('login');
             const [username, setUsername] = useState(localStorage.getItem('username') || '');
-            const [email, setEmail] = useState(''); // Added Email for registration
+            const [email, setEmail] = useState('');
             const [password, setPassword] = useState('');
             const [authError, setAuthError] = useState(null);
             
-            // --- Profile State ---
             const [profileData, setProfileData] = useState(null);
 
-            // --- App State ---
             const [activeTab, setActiveTab] = useState('new');
             const [target, setTarget] = useState('scanme.nmap.org');
             const [scheduleType, setScheduleType] = useState('interval');
@@ -87,7 +83,6 @@
                 'Content-Type': 'application/json'
             });
 
-            // --- Authentication ---
             const handleAuth = async (e) => {
                 e.preventDefault();
                 setAuthError(null);
@@ -134,7 +129,6 @@
                 setActiveTab('new');
             };
 
-            // --- Fetch Profile ---
             const fetchProfile = async () => {
                 try {
                     const res = await fetch('http://localhost:8000/users/me', { headers: getAuthHeaders() });
@@ -152,16 +146,40 @@
                 setHistory(await res.json());
             };
 
+            // Fetch profile data globally upon login so sidebar avatar updates
+            useEffect(() => {
+                if (token) fetchProfile();
+            }, [token]);
+
             useEffect(() => { 
-                if (token) {
-                    if (activeTab === 'history' || activeTab === 'automated' || activeTab === 'search') {
-                        fetchHistory(); 
-                    }
-                    if (activeTab === 'profile') {
-                        fetchProfile();
-                    }
+                if (token && (activeTab === 'history' || activeTab === 'automated' || activeTab === 'search')) {
+                    fetchHistory(); 
                 }
             }, [activeTab, token]);
+
+            const handleAvatarUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                const reader = new FileReader();
+                reader.onloadend = async () => {
+                    const base64String = reader.result;
+                    try {
+                        const res = await fetch('http://localhost:8000/users/me/avatar', {
+                            method: 'PUT',
+                            headers: getAuthHeaders(),
+                            body: JSON.stringify({ avatar_data: base64String })
+                        });
+                        if (res.ok) {
+                            fetchProfile(); // Refresh profile to show new image
+                            setAlertMsg({ type: 'success', text: "Profile picture updated!" });
+                        }
+                    } catch (err) {
+                        setAlertMsg({ type: 'error', text: "Failed to update profile picture." });
+                    }
+                };
+                reader.readAsDataURL(file);
+            };
 
             const handleScan = async (e) => {
                 e.preventDefault();
@@ -261,7 +279,8 @@
                 </div>
             );
 
-            // --- LOGGED OUT VIEW ---
+            const displayAvatar = profileData?.avatar_data || `https://api.dicebear.com/7.x/initials/svg?seed=${username}&backgroundColor=3b82f6`;
+
             if (!token) {
                 return (
                     <div className="min-h-screen bg-gray-50 dark:bg-geminiDark flex items-center justify-center p-4">
@@ -307,7 +326,6 @@
                 );
             }
 
-            // --- LOGGED IN DASHBOARD ---
             return (
                 <div className="flex h-screen bg-white dark:bg-geminiDark text-gray-900 dark:text-gray-100 transition-colors duration-300">
                     
@@ -328,9 +346,8 @@
                                 <i className="fa-solid fa-gear text-lg"></i>
                             </div>
                             
-                            {/* NEW: Click opens Profile Tab instead of Logout */}
                             <div title="My Profile" onClick={() => setActiveTab('profile')} className={`cursor-pointer w-10 h-10 flex items-center justify-center rounded-full transition-all ${activeTab === 'profile' ? 'bg-blue-600/20' : ''}`}>
-                                <img src={`https://api.dicebear.com/7.x/initials/svg?seed=${username}&backgroundColor=3b82f6`} alt="Profile" className="w-9 h-9 rounded-full ring-2 ring-transparent hover:ring-blue-500 transition-all shadow-md" />
+                                <img src={displayAvatar} alt="Profile" className="w-9 h-9 rounded-full ring-2 ring-transparent hover:ring-blue-500 transition-all shadow-md object-cover" />
                             </div>
                         </div>
                     </div>
@@ -338,7 +355,6 @@
                     <div className="flex-1 overflow-y-auto p-6 md:p-10">
                         <div className="max-w-4xl mx-auto w-full">
                             
-                            {/* Hide greeting if we are on the Profile page to keep UI clean */}
                             {activeTab !== 'profile' && (
                                 <div className="mb-10 animate-fade-in-up">
                                     <h1 className="text-3xl md:text-4xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-blue-500 to-indigo-500 mb-2 tracking-tight">
@@ -362,12 +378,17 @@
                                     <div className="glass-panel rounded-2xl shadow-sm overflow-hidden">
                                         <div className="h-32 bg-gradient-to-r from-blue-600 to-indigo-600"></div>
                                         <div className="px-8 pb-8 relative">
-                                            {/* Avatar pulled halfway over the banner */}
-                                            <div className="absolute -top-12 border-4 border-white dark:border-geminiSidebar rounded-full bg-white">
-                                                <img src={`https://api.dicebear.com/7.x/initials/svg?seed=${username}&backgroundColor=3b82f6`} alt="Profile" className="w-24 h-24 rounded-full" />
+                                            
+                                            {/* Fixed UI Overlap: Changed mt-16 to pt-16 so text slides cleanly under absolute element */}
+                                            <div className="absolute -top-12 border-4 border-white dark:border-geminiSidebar rounded-full bg-white group cursor-pointer w-24 h-24">
+                                                <img src={displayAvatar} alt="Profile" className="w-full h-full rounded-full object-cover" />
+                                                <label className="absolute inset-0 bg-black/50 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer text-white text-2xl">
+                                                    <i className="fa-solid fa-camera"></i>
+                                                    <input type="file" accept="image/*" className="hidden" onChange={handleAvatarUpload} />
+                                                </label>
                                             </div>
                                             
-                                            <div className="mt-16">
+                                            <div className="pt-16">
                                                 <h2 className="text-3xl font-extrabold tracking-tight dark:text-white text-gray-900">{profileData?.username || username}</h2>
                                                 <p className="text-gray-500 dark:text-gray-400 font-medium mb-6">Security Analyst / User</p>
                                                 
@@ -393,7 +414,6 @@
                                 </div>
                             )}
 
-                            {/* TAB: NEW SCAN */}
                             {activeTab === 'new' && (
                                 <div className="space-y-8">
                                     <div className="glass-panel p-6 md:p-8 rounded-2xl shadow-sm">
@@ -478,7 +498,6 @@
                                 </div>
                             )}
 
-                            {/* TAB: SCHEDULE SCAN */}
                             {activeTab === 'schedule' && (
                                 <div className="glass-panel p-6 md:p-8 rounded-2xl shadow-sm max-w-2xl">
                                     <h3 className="text-xl font-bold mb-2 flex items-center tracking-tight"><i className="fa-solid fa-calendar-plus mr-3 text-purple-500"></i>Automated Task Scheduler</h3>
@@ -618,7 +637,6 @@
                         </div>
                     </div>
 
-                    {/* SETTINGS MODAL */}
                     {isSettingsOpen && (
                         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
                             <div className="bg-white dark:bg-geminiSidebar w-full max-w-md rounded-2xl shadow-2xl overflow-hidden animate-fade-in-up">
