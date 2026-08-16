@@ -76,7 +76,6 @@ app = FastAPI(title="SentinelX API", version="2.2")
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# --- EVIDENCE STORE DIRECTORY MOUNT ---
 if not os.path.exists("evidence_store"):
     os.makedirs("evidence_store")
 app.mount("/evidence", StaticFiles(directory="evidence_store"), name="evidence")
@@ -270,7 +269,6 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
     db = SessionLocal()
     nm = nmap.PortScanner()
     try:
-        # 🚀 SPEED OPTIMIZATION 1: Added -T4 and --max-retries 1 for faster Nmap
         nm.scan(target, arguments='-sV -F -T4 --max-retries 1')
         host = target if target in nm.all_hosts() else (nm.all_hosts()[0] if nm.all_hosts() else None)
         if not host: return None
@@ -286,7 +284,7 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
         
         services_data = []
         current_open_ports = []
-        web_targets = [] # Collect all web targets first
+        web_targets = []
 
         for proto in nm[host].all_protocols():
             for port in nm[host][proto].keys():
@@ -305,12 +303,11 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
                 )
                 db.add(svc)
                 services_data.append({
-                    "db_obj": svc, # Keep reference to update later
+                    "db_obj": svc,
                     "port": port, "protocol": proto, "state": state, "service": name, "version_info": full_version, 
                     "cves": cves_str.split(",") if cves_str else [], "web_info": None
                 })
         
-        # 🚀 SPEED OPTIMIZATION 2: Run all screenshot tasks concurrently (Parallel)
         async def fetch_all_web_info():
             async def fetch_single(wt):
                 p = wt["port"]
@@ -330,14 +327,13 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
             web_results = asyncio.run(fetch_all_web_info())
             web_map = {res[0]: res[1] for res in web_results if isinstance(res, tuple)}
             
-            # Map fast results back to database
             for s in services_data:
                 port = s["port"]
                 if port in web_map:
                     s["web_info"] = web_map[port]
                     s["db_obj"].web_info = json.dumps(web_map[port])
         
-        for s in services_data: del s["db_obj"] # Cleanup
+        for s in services_data: del s["db_obj"]
         db.commit()
 
         changes = {"is_first_scan": previous_scan is None, "new_ports": list(set(current_open_ports) - set(previous_ports)), "closed_ports": list(set(previous_ports) - set(current_open_ports))}

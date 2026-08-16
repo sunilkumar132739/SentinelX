@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="color-scheme" content="dark light">
     <meta name="darkreader-lock">
-    <title>SentinelX | Advanced Threat Surface/title>
+    <title>SentinelX | Spatial UI (Light/Dark)</title>
     
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -136,7 +136,7 @@
         .text-muted { color: var(--text-muted) !important; -webkit-text-fill-color: var(--text-muted) !important; }
         .border-theme { border-color: var(--panel-border) !important; }
 
-        /* Semantic Overrides (Forces color even if browser tries to invert) */
+        /* Semantic Overrides */
         .text-red-500 { color: #ef4444 !important; -webkit-text-fill-color: #ef4444 !important; }
         .text-green-500 { color: #22c55e !important; -webkit-text-fill-color: #22c55e !important; }
         .text-yellow-500 { color: #eab308 !important; -webkit-text-fill-color: #eab308 !important; }
@@ -353,8 +353,6 @@
             );
 
             const displayAvatar = profileData?.avatar_data || `https://api.dicebear.com/7.x/initials/svg?seed=${username}&backgroundColor=3b82f6`;
-
-            // Wraps the entire app in either .light-mode or .dark-mode to trigger CSS variable swaps
             const themeClass = isLightMode ? "light-mode" : "dark-mode";
 
             if (!token) {
@@ -414,11 +412,9 @@
                         </div>
 
                         <div className="flex flex-col items-center space-y-4">
-                            {/* THEME TOGGLE BUTTON */}
                             <div onClick={() => setIsLightMode(!isLightMode)} title="Toggle Light/Dark Mode" className="w-12 h-12 flex items-center justify-center rounded-xl cursor-pointer text-muted hover:opacity-80 transition-all">
                                 <i className={`fa-solid ${isLightMode ? 'fa-moon' : 'fa-sun'} text-xl`}></i>
                             </div>
-
                             <div onClick={() => setIsSettingsOpen(true)} title="Settings" className="w-12 h-12 flex items-center justify-center rounded-xl cursor-pointer text-muted hover:opacity-80 transition-all">
                                 <i className="fa-solid fa-gear text-xl"></i>
                             </div>
@@ -504,6 +500,7 @@
                                         <div className="space-y-6">
                                             <div className="flex justify-between items-end pb-2 border-b border-theme">
                                                 <h2 className="text-2xl font-extrabold tracking-tight text-main">Results for <span className="opacity-80">{results.target_ip}</span></h2>
+                                                
                                                 <button onClick={() => window.open(`http://localhost:8000/scans/${results.scan_id}/pdf`, '_blank')} className="flex items-center px-5 py-2.5 glass-btn text-sm font-bold">
                                                     <i className="fa-solid fa-file-pdf mr-2 text-red-500"></i><span>Export PDF</span>
                                                 </button>
@@ -619,6 +616,19 @@
                                                                         </div>
                                                                     </div>
                                                                 )}
+                                                                
+                                                                {/* Display Evidence Screenshot */}
+                                                                {svc.web_info.screenshot && (
+                                                                    <div className="mt-3">
+                                                                        <div className="text-[9px] uppercase font-black text-muted mb-1.5 tracking-wider">Visual Evidence</div>
+                                                                        <div className="rounded-xl overflow-hidden border border-theme relative group">
+                                                                            <img src={`http://localhost:8000${svc.web_info.screenshot}`} alt="Evidence" className="w-full h-auto object-cover opacity-80 group-hover:opacity-100 transition-opacity" />
+                                                                            <div className="absolute inset-0 bg-black/40 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                                                                                <a href={`http://localhost:8000${svc.web_info.screenshot}`} target="_blank" className="glass-btn px-4 py-2 text-xs">View Full Size</a>
+                                                                            </div>
+                                                                        </div>
+                                                                    </div>
+                                                                )}
                                                             </div>
                                                         )}
 
@@ -683,7 +693,6 @@
                                         </form>
                                     </div>
 
-                                    {/* Active Tasks List */}
                                     <div className="glass-panel p-8 max-w-2xl border-l-4 border-yellow-500">
                                         <h3 className="text-lg font-extrabold mb-4 flex items-center text-main"><i className="fa-solid fa-bolt mr-3 text-yellow-500"></i> Active Running Tasks</h3>
                                         {activeSchedules.length === 0 ? (
