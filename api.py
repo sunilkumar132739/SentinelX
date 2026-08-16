@@ -1,3 +1,7 @@
+from fastapi.staticfiles import StaticFiles
+from evidence import capture_web_evidence
+import os
+import asyncio
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,6 +75,11 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="SentinelX API", version="2.2")
 scheduler = BackgroundScheduler()
 scheduler.start()
+
+# --- EVIDENCE STORE DIRECTORY MOUNT ---
+if not os.path.exists("evidence_store"):
+    os.makedirs("evidence_store")
+app.mount("/evidence", StaticFiles(directory="evidence_store"), name="evidence")
 
 app.add_middleware(
     CORSMiddleware,
@@ -261,7 +270,8 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
     db = SessionLocal()
     nm = nmap.PortScanner()
     try:
-        nm.scan(target, arguments='-sV -F')
+        # 🚀 SPEED OPTIMIZATION 1: Added -T4 and --max-retries 1 for faster Nmap
+        nm.scan(target, arguments='-sV -F -T4 --max-retries 1')
         host = target if target in nm.all_hosts() else (nm.all_hosts()[0] if nm.all_hosts() else None)
         if not host: return None
         hostname = nm[host].hostname() if nm[host].hostname() else host
@@ -276,6 +286,7 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
         
         services_data = []
         current_open_ports = []
+        web_targets = [] # Collect all web targets first
 
         for proto in nm[host].all_protocols():
             for port in nm[host][proto].keys():
@@ -285,22 +296,48 @@ def perform_scan(target: str, owner_id: int, scan_type: str = "manual"):
                 if state == 'open': current_open_ports.append(port)
                 cves_str = ",".join(get_cves_for_service(name, nm[host][proto][port].get('version', ''))) if state == 'open' and full_version else ""
 
-                web_info_json = None
                 if state == 'open' and (port in [80, 443, 8080, 8443] or 'http' in name):
-                    web_info_json = analyze_web_target(host, port)
+                    web_targets.append({"port": port, "host": host})
 
                 svc = ServiceDetail(
                     scan_id=db_scan.id, port=port, protocol=proto, state=state, service_name=name, 
-                    version_info=full_version, cves=cves_str, web_info=web_info_json
+                    version_info=full_version, cves=cves_str, web_info=None
                 )
                 db.add(svc)
-                
-                web_info_dict = json.loads(web_info_json) if web_info_json else None
                 services_data.append({
+                    "db_obj": svc, # Keep reference to update later
                     "port": port, "protocol": proto, "state": state, "service": name, "version_info": full_version, 
-                    "cves": cves_str.split(",") if cves_str else [], "web_info": web_info_dict
+                    "cves": cves_str.split(",") if cves_str else [], "web_info": None
                 })
         
+        # 🚀 SPEED OPTIMIZATION 2: Run all screenshot tasks concurrently (Parallel)
+        async def fetch_all_web_info():
+            async def fetch_single(wt):
+                p = wt["port"]
+                h = wt["host"]
+                web_info_str = analyze_web_target(h, p)
+                web_info_dict = json.loads(web_info_str) if web_info_str else {}
+                try:
+                    screenshot_url = await capture_web_evidence(h, p)
+                    if screenshot_url: web_info_dict["screenshot"] = screenshot_url
+                except Exception: pass
+                return p, web_info_dict
+            
+            tasks = [fetch_single(wt) for wt in web_targets]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        if web_targets:
+            web_results = asyncio.run(fetch_all_web_info())
+            web_map = {res[0]: res[1] for res in web_results if isinstance(res, tuple)}
+            
+            # Map fast results back to database
+            for s in services_data:
+                port = s["port"]
+                if port in web_map:
+                    s["web_info"] = web_map[port]
+                    s["db_obj"].web_info = json.dumps(web_map[port])
+        
+        for s in services_data: del s["db_obj"] # Cleanup
         db.commit()
 
         changes = {"is_first_scan": previous_scan is None, "new_ports": list(set(current_open_ports) - set(previous_ports)), "closed_ports": list(set(previous_ports) - set(current_open_ports))}
@@ -343,17 +380,15 @@ def schedule_scan(req: ScheduleRequest, current_user: User = Depends(get_current
         scheduler.add_job(perform_scan, 'interval', minutes=req.minutes or 60, args=[req.target, current_user.id, "automated"], id=job_id, replace_existing=True)
         return {"message": f"Successfully scheduled recurring scan for {req.target} every {req.minutes} minutes.", "job_id": job_id}
 
-# --- NEW: Endpoints to manage active background jobs ---
 @app.get("/schedules")
 def get_schedules(current_user: User = Depends(get_current_user)):
     jobs = scheduler.get_jobs()
     user_jobs = []
     for job in jobs:
-        # Check if job belongs to current user
         if job.id.endswith(f"_{current_user.id}"):
             user_jobs.append({
                 "id": job.id,
-                "target": job.args[0], # Target is the first argument passed to perform_scan
+                "target": job.args[0], 
                 "next_run": job.next_run_time.isoformat() if job.next_run_time else "Running now"
             })
     return user_jobs
